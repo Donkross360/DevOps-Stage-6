@@ -56,8 +56,8 @@ jobs:
         continue-on-error: true
 
       - name: Create terraform.tfvars from GitHub Secrets
-          working-directory: infra/terraform
-          run: |
+        working-directory: infra/terraform
+        run: |
             cat > terraform.tfvars <<EOF
             aws_region = "${{ secrets.AWS_REGION || 'us-east-1' }}"
             instance_type = "${{ secrets.TERRAFORM_INSTANCE_TYPE || 't3.medium' }}"
