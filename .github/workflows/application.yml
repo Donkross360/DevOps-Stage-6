@@ -1,0 +1,66 @@
+name: Application Deployment
+
+on:
+  push:
+    paths:
+      - 'frontend/**'
+      - 'auth-api/**'
+      - 'todos-api/**'
+      - 'users-api/**'
+      - 'log-message-processor/**'
+      - 'docker-compose.yml'
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'auth-api/**'
+      - 'todos-api/**'
+      - 'users-api/**'
+      - 'log-message-processor/**'
+      - 'docker-compose.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Server IP from Terraform State
+        id: get-server-ip
+        working-directory: infra/terraform
+        run: |
+          if [ -f terraform.tfstate ]; then
+            SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
+            if [ -z "$SERVER_IP" ]; then
+              # Fallback: extract from state file
+              SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+            fi
+            echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+            echo "Server IP: $SERVER_IP"
+          else
+            echo "Error: terraform.tfstate not found. Please run infrastructure workflow first."
+            exit 1
+          fi
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ steps.get-server-ip.outputs.server_ip }} >> ~/.ssh/known_hosts
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
+
+      - name: Deploy Application
+        run: |
+          cd infra/ansible
+          ansible-playbook -i inventory/hosts.yml playbook.yml --tags deploy
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: False
+          ANSIBLE_SSH_PRIVATE_KEY_FILE: ~/.ssh/id_rsa
+
