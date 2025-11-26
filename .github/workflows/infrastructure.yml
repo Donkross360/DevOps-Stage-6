@@ -264,34 +264,98 @@ jobs:
         id: get-server-ip
         working-directory: infra/terraform
         run: |
-          # Initialize Terraform to read outputs
-          terraform init -backend=false 2>/dev/null || true
+          echo "Checking for Terraform state file..."
+          ls -la terraform.tfstate* 2>/dev/null || echo "No state files found"
           
-          # Try to get server IP from output
-          SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
-          
-          # Fallback: extract from state file
-          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
-            echo "Extracting server IP from state file..."
-            SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+          # Check if state file exists
+          if [ ! -f terraform.tfstate ]; then
+            echo "ERROR: terraform.tfstate file not found"
+            exit 1
           fi
           
-          # Additional fallback: query AWS directly
+          # Initialize Terraform to read outputs
+          terraform init -backend=false || true
+          
+          # Try to get server IP from Terraform output
+          echo "Trying Terraform output..."
+          SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
+          echo "Terraform output result: '$SERVER_IP'"
+          
+          # Fallback 1: Extract from state file using jq (if available) or grep
           if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
-            echo "Querying AWS for server IP..."
-            INSTANCE_ID=$(grep -o '"id":"i-[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
-            if [ -n "$INSTANCE_ID" ]; then
-              SERVER_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || echo "")
+            echo "Extracting server IP from state file using jq..."
+            if command -v jq &> /dev/null; then
+              SERVER_IP=$(jq -r '.resources[] | select(.type == "aws_instance") | .instances[0].attributes.public_ip // empty' terraform.tfstate 2>/dev/null | head -1 || echo "")
             fi
           fi
           
+          # Fallback 2: Extract using grep from state file
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
+            echo "Extracting server IP from state file using grep..."
+            SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+            # Also try with escaped quotes
+            if [ -z "$SERVER_IP" ]; then
+              SERVER_IP=$(grep -oP '"public_ip":\s*"\K[^"]+' terraform.tfstate | head -1 || echo "")
+            fi
+            # Try without quotes
+            if [ -z "$SERVER_IP" ]; then
+              SERVER_IP=$(grep -o 'public_ip[^"]*"[^"]*"\([0-9.]\+\)' terraform.tfstate | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "")
+            fi
+          fi
+          
+          # Fallback 3: Query AWS directly - find by tag first (most reliable)
           if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "None" ]; then
+            echo "Querying AWS for server IP by tag..."
+            # Find instance by tag (most reliable method)
+            INSTANCE_ID=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --query 'Reservations[0].Instances[0].InstanceId' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] && [ "$INSTANCE_ID" != "null" ]; then
+              echo "Found instance by tag: $INSTANCE_ID"
+              SERVER_IP=$(aws ec2 describe-instances \
+                --instance-ids "$INSTANCE_ID" \
+                --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                --output text 2>/dev/null || echo "")
+              echo "AWS query by tag result: '$SERVER_IP'"
+            fi
+          fi
+          
+          # Fallback 4: Query AWS using instance ID from state file
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "None" ]; then
+            echo "Querying AWS using instance ID from state..."
+            # Try to get instance ID from state file
+            INSTANCE_ID=$(grep -o '"id":"i-[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+            if [ -z "$INSTANCE_ID" ]; then
+              INSTANCE_ID=$(grep -oE 'i-[a-z0-9]{17}' terraform.tfstate | head -1 || echo "")
+            fi
+            
+            echo "Found instance ID in state: '${INSTANCE_ID:-empty}'"
+            
+            if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ] && [ "$INSTANCE_ID" != "None" ]; then
+              echo "Querying AWS EC2 for public IP..."
+              SERVER_IP=$(aws ec2 describe-instances \
+                --instance-ids "$INSTANCE_ID" \
+                --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                --output text 2>/dev/null || echo "")
+              echo "AWS query by instance ID result: '$SERVER_IP'"
+            fi
+          fi
+          
+          # Final validation
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "None" ] || [ "$SERVER_IP" == "-" ]; then
             echo "ERROR: Could not determine server IP address"
+            echo "Debugging info:"
+            echo "State file exists: $([ -f terraform.tfstate ] && echo 'yes' || echo 'no')"
+            echo "State file size: $(wc -c < terraform.tfstate) bytes"
+            echo "First 500 chars of state file:"
+            head -c 500 terraform.tfstate || true
             exit 1
           fi
           
           echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
-          echo "Server IP: $SERVER_IP"
+          echo "✓ Server IP: $SERVER_IP"
 
       - name: Setup SSH
         run: |
