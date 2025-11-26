@@ -108,9 +108,15 @@ jobs:
             ```
             ${{ steps.drift-check.outputs.drift_summary }}
             ```
+          issue-create-on-fail: false
+        continue-on-error: true
+        id: manual-approval
 
       - name: Terraform Apply
-        if: steps.drift-check.outputs.drift_detected == 'false' || github.event_name == 'workflow_dispatch'
+        if: |
+          steps.drift-check.outputs.drift_detected == 'false' || 
+          github.event_name == 'workflow_dispatch' ||
+          (steps.drift-check.outputs.drift_detected == 'true' && steps.manual-approval.outcome == 'success')
         working-directory: infra/terraform
         run: terraform apply -auto-approve tfplan
 
