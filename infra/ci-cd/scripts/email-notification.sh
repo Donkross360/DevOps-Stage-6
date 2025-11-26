@@ -11,13 +11,14 @@ if [ -z "$DRIFT_SUMMARY" ]; then
   exit 1
 fi
 
-# Email configuration from environment variables or secrets
-EMAIL_TO="${EMAIL_TO:-${{ secrets.EMAIL_TO }}}"
+# Email configuration from environment variables
+# These should be set by the workflow as environment variables
+EMAIL_TO="${EMAIL_TO:-}"
 EMAIL_FROM="${EMAIL_FROM:-terraform-drift@github-actions.com}"
 SMTP_SERVER="${SMTP_SERVER:-smtp.gmail.com}"
 SMTP_PORT="${SMTP_PORT:-587}"
-SMTP_USER="${SMTP_USER:-${{ secrets.SMTP_USER }}}"
-SMTP_PASS="${SMTP_PASS:-${{ secrets.SMTP_PASS }}}"
+SMTP_USER="${SMTP_USER:-}"
+SMTP_PASS="${SMTP_PASS:-}"
 
 # If email is not configured, use GitHub API to create an issue instead
 if [ -z "$EMAIL_TO" ] && [ -z "$SMTP_USER" ]; then

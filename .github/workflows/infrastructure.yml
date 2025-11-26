@@ -88,6 +88,10 @@ jobs:
         run: |
           chmod +x ./infra/ci-cd/scripts/email-notification.sh
           ./infra/ci-cd/scripts/email-notification.sh "$(cat infra/terraform/drift_summary.txt)"
+        env:
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
       - name: Manual Approval
         if: steps.drift-check.outputs.drift_detected == 'true'
