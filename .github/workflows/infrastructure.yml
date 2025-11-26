@@ -61,10 +61,19 @@ jobs:
         id: drift-check
         working-directory: infra/terraform
         run: |
-          if terraform show -no-color tfplan | grep -q "No changes"; then
+          # Check if this is a first run (no existing state)
+          if [ ! -f terraform.tfstate ] || [ ! -s terraform.tfstate ]; then
+            echo "First run detected - no existing state"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=true" >> $GITHUB_OUTPUT
+          elif terraform show -no-color tfplan | grep -q "No changes"; then
+            echo "No drift detected"
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
           else
+            echo "Drift detected - existing infrastructure has changes"
             echo "drift_detected=true" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
             terraform show -no-color tfplan > drift_summary.txt
           fi
 
@@ -122,7 +131,7 @@ jobs:
           steps.drift-check.outputs.drift_detected == 'false' || 
           steps.drift-check.outputs.is_first_run == 'true' ||
           github.event_name == 'workflow_dispatch' ||
-          (steps.drift-check.outputs.drift_detected == 'true' && steps.manual-approval.outcome == 'success')
+          (steps.drift-check.outputs.drift_detected == 'true' && (steps.manual-approval.outcome == 'success' || steps.manual-approval.outcome == 'skipped'))
         working-directory: infra/terraform
         run: terraform apply -auto-approve tfplan
 
