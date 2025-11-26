@@ -86,6 +86,7 @@ jobs:
       - name: Send Drift Email
         if: steps.drift-check.outputs.drift_detected == 'true'
         run: |
+          chmod +x ./infra/ci-cd/scripts/email-notification.sh
           ./infra/ci-cd/scripts/email-notification.sh "$(cat infra/terraform/drift_summary.txt)"
 
       - name: Manual Approval
