@@ -23,7 +23,30 @@ Go to: **Repository → Settings → Secrets and variables → Actions → New r
 - **Default**: `us-east-1` (if not set)
 - **Example**: `us-east-1`, `us-west-2`, `eu-west-1`
 
-### 2. SSH Private Key (Required for Ansible)
+### 2. Terraform Variables (Required for Infrastructure)
+
+#### `TERRAFORM_KEY_PAIR_NAME`
+- **Description**: Name of your AWS Key Pair (must exist in AWS)
+- **How to get**: AWS Console → EC2 → Key Pairs → Copy the name
+- **Example**: `my-key-pair`, `todo-app-key`
+- **Important**: This must match an existing Key Pair in your AWS account
+
+#### `TERRAFORM_INSTANCE_TYPE` (Optional)
+- **Description**: EC2 instance type
+- **Default**: `t3.medium` (if not set)
+- **Example**: `t3.micro`, `t3.small`, `t3.medium`
+
+#### `TERRAFORM_SSH_CIDR` (Optional)
+- **Description**: CIDR block for SSH access
+- **Default**: `0.0.0.0/0` (if not set - allows SSH from anywhere)
+- **Example**: `0.0.0.0/0`, `1.2.3.4/32` (restrict to your IP)
+
+#### `TERRAFORM_STATE_VOLUME_SIZE` (Optional)
+- **Description**: Size of EBS volume for Terraform state (GB)
+- **Default**: `10` (if not set)
+- **Example**: `10`, `20`
+
+### 3. SSH Private Key (Required for Ansible)
 
 #### `SSH_PRIVATE_KEY`
 - **Description**: Your SSH private key for connecting to the EC2 instance

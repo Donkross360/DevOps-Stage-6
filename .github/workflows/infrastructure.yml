@@ -38,9 +38,24 @@ jobs:
         working-directory: infra/terraform
         run: terraform init
 
+      - name: Create terraform.tfvars from GitHub Secrets
+        working-directory: infra/terraform
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_region = "${{ secrets.AWS_REGION || 'us-east-1' }}"
+          instance_type = "${{ secrets.TERRAFORM_INSTANCE_TYPE || 't3.medium' }}"
+          key_pair_name = "${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
+          ssh_key_path = "${{ secrets.TERRAFORM_SSH_KEY_PATH || '~/.ssh/id_rsa' }}"
+          ssh_cidr = "${{ secrets.TERRAFORM_SSH_CIDR || '0.0.0.0/0' }}"
+          server_user = "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}"
+          state_volume_size = ${{ secrets.TERRAFORM_STATE_VOLUME_SIZE || 10 }}
+          availability_zone = ""
+          EOF
+          cat terraform.tfvars
+
       - name: Terraform Plan
         working-directory: infra/terraform
-        run: terraform plan -out=tfplan
+        run: terraform plan -out=tfplan -var-file=terraform.tfvars
         continue-on-error: true
 
       - name: Check for Drift
