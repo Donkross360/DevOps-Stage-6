@@ -146,6 +146,7 @@ jobs:
           name: terraform-state
           path: infra/terraform/terraform.tfstate
           retention-days: 1
+          if-no-files-found: ignore
 
   ansible-deploy:
     name: Ansible Deployment
