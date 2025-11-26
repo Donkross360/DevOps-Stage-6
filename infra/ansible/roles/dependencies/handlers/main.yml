@@ -1,0 +1,7 @@
+---
+# Handlers for dependencies role (if needed)
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted
+

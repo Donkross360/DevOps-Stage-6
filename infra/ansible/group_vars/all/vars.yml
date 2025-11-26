@@ -1,0 +1,33 @@
+---
+# Repository configuration
+repo_url: https://github.com/Donkross360/DevOps-Stage-6.git  # Update with your repo
+repo_branch: main
+
+# Domain and SSL configuration
+domain: "tutor-ai.im"  # Will be set from .env or GitHub Secrets
+letsencrypt_email: "martlab727@gmail.com"  # Will be set from .env or GitHub Secrets
+
+# Application ports
+frontend_port: 8080
+auth_api_port: 8081
+todos_api_port: 8082
+users_api_port: 8083
+
+# API addresses
+auth_api_address: "http://auth-api:8081"
+todos_api_address: "http://todos-api:8082"
+users_api_address: "http://users-api:8083"
+auth_api_url: "http://auth-api:8081"
+
+# JWT Secret
+jwt_secret: "myfancysecret"  # Change in production!
+
+# Redis configuration
+redis_host: redis
+redis_port: 6379
+redis_channel: log-messages
+redis_url: "redis://redis:6379"
+
+# Server user (from Terraform)
+server_user: ubuntu
+

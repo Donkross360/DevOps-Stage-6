@@ -1,0 +1,9 @@
+---
+- name: verify deployment
+  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" ps
+  register: final_status
+  changed_when: false
+  become_user: "{{ app_user }}"
+  args:
+    chdir: "{{ app_dir }}"
+

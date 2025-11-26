@@ -1,0 +1,128 @@
+---
+- name: Create application directory
+  file:
+    path: "{{ app_dir }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0755'
+
+- name: Check if repository exists
+  stat:
+    path: "{{ app_dir }}/.git"
+  register: repo_exists
+
+- name: Clone repository
+  git:
+    repo: "{{ repo_url }}"
+    dest: "{{ app_dir }}"
+    version: "{{ repo_branch | default('main') }}"
+    update: yes
+  when: not repo_exists.stat.exists
+
+- name: Pull latest changes
+  git:
+    repo: "{{ repo_url }}"
+    dest: "{{ app_dir }}"
+    version: "{{ repo_branch | default('main') }}"
+    update: yes
+  when: repo_exists.stat.exists
+  register: git_pull_result
+
+- name: Create letsencrypt directory
+  file:
+    path: "{{ app_dir }}/letsencrypt"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0755'
+
+- name: Create acme.json with correct permissions
+  file:
+    path: "{{ app_dir }}/letsencrypt/acme.json"
+    state: touch
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0600'
+
+- name: Create .env file from template
+  template:
+    src: env.j2
+    dest: "{{ app_dir }}/.env"
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0600'
+  when: create_env_file | default(true)
+
+- name: Create .env file from variables (if no template)
+  copy:
+    content: |
+      # Domain and SSL
+      DOMAIN="{{ domain | default('') }}"
+      LETSENCRYPT_EMAIL="{{ letsencrypt_email | default('') }}"
+
+      # Frontend
+      FRONTEND_PORT={{ frontend_port | default(8080) }}
+      AUTH_API_ADDRESS={{ auth_api_address | default('http://auth-api:8081') }}
+      TODOS_API_ADDRESS={{ todos_api_address | default('http://todos-api:8082') }}
+
+      # Auth API
+      AUTH_API_PORT={{ auth_api_port | default(8081) }}
+      USERS_API_ADDRESS={{ users_api_address | default('http://users-api:8083') }}
+      JWT_SECRET={{ jwt_secret | default('myfancysecret') }}
+
+      # Todos API
+      TODOS_API_PORT={{ todos_api_port | default(8082) }}
+      AUTH_API_URL={{ auth_api_url | default('http://auth-api:8081') }}
+
+      # Users API
+      USERS_API_PORT={{ users_api_port | default(8083) }}
+
+      # Log Processor
+      REDIS_HOST={{ redis_host | default('redis') }}
+      REDIS_PORT={{ redis_port | default(6379) }}
+      REDIS_CHANNEL={{ redis_channel | default('log-messages') }}
+
+      # Redis (shared)
+      REDIS_URL={{ redis_url | default('redis://redis:6379') }}
+    dest: "{{ app_dir }}/.env"
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode: '0600'
+  when: not (create_env_file | default(true))
+
+- name: Check if docker-compose is running
+  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" ps
+  register: compose_status
+  changed_when: false
+  failed_when: false
+  become_user: "{{ app_user }}"
+  args:
+    chdir: "{{ app_dir }}"
+
+- name: Stop existing containers
+  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" down
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  when: compose_status.rc == 0
+
+- name: Build and start containers
+  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" up -d --build
+  args:
+    chdir: "{{ app_dir }}"
+  become_user: "{{ app_user }}"
+  register: compose_up_result
+  notify: verify deployment
+
+- name: Wait for services to be healthy
+  wait_for:
+    port: 80
+    host: localhost
+    delay: 10
+    timeout: 300
+
+- name: Display deployment status
+  debug:
+    msg: "Application deployed successfully. Access at https://{{ domain | default('your-domain.com') }}"
+

@@ -1,0 +1,20 @@
+---
+- name: Configure TODO Application Server
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    app_user: "{{ server_user | default('ubuntu') }}"
+    app_dir: /opt/todo-app
+
+  roles:
+    - role: dependencies
+    - role: deploy
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
