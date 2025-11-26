@@ -135,7 +135,7 @@ jobs:
         if: |
           steps.drift-check.outputs.drift_detected != 'true' || 
           steps.drift-check.outputs.is_first_run == 'true' ||
-          (steps.drift-check.outputs.drift_detected == 'true' && steps.drift-check.outputs.is_first_run != 'true' && (steps.manual-approval.conclusion == 'success' || steps.manual-approval.outcome == 'success'))
+          (steps.drift-check.outputs.drift_detected == 'true' && steps.drift-check.outputs.is_first_run != 'true' && steps.manual-approval.outcome == 'success')
         working-directory: infra/terraform
         run: terraform apply -auto-approve tfplan
 
