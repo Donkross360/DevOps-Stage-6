@@ -51,7 +51,12 @@ data "aws_ami" "ubuntu" {
 # Security Group
 resource "aws_security_group" "todo_app" {
   name        = "todo-app-sg"
+  name_prefix = null
   description = "Security group for TODO application"
+  
+  lifecycle {
+    create_before_destroy = true
+  }
 
   ingress {
     description = "HTTP"

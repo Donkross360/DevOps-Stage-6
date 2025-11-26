@@ -57,6 +57,29 @@ jobs:
           availability_zone = ""
           EOF
 
+      - name: Import existing security group (if exists)
+        working-directory: infra/terraform
+        run: |
+          # Try to find existing security group by name
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=todo-app-sg" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            echo "Found existing security group: $SG_ID"
+            # Check if already in state
+            if ! terraform state show aws_security_group.todo_app 2>/dev/null; then
+              echo "Importing existing security group into Terraform state..."
+              terraform import -var-file=terraform.tfvars aws_security_group.todo_app "$SG_ID" || echo "Import failed, will create new one"
+            else
+              echo "Security group already in Terraform state"
+            fi
+          else
+            echo "No existing security group found"
+          fi
+        continue-on-error: true
+
       - name: Terraform Plan
         working-directory: infra/terraform
         run: terraform plan -out=tfplan -var-file=terraform.tfvars
