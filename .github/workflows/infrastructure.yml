@@ -51,7 +51,6 @@ jobs:
           state_volume_size = ${{ secrets.TERRAFORM_STATE_VOLUME_SIZE || 10 }}
           availability_zone = ""
           EOF
-          cat terraform.tfvars
 
       - name: Terraform Plan
         working-directory: infra/terraform
