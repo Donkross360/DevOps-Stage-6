@@ -131,7 +131,7 @@ jobs:
           steps.drift-check.outputs.drift_detected == 'false' || 
           steps.drift-check.outputs.is_first_run == 'true' ||
           github.event_name == 'workflow_dispatch' ||
-          (steps.drift-check.outputs.drift_detected == 'true' && (steps.manual-approval.conclusion == 'success' || steps.manual-approval.conclusion == 'skipped'))
+          (steps.drift-check.outputs.drift_detected == 'true' && steps.manual-approval.conclusion == 'success')
         working-directory: infra/terraform
         run: terraform apply -auto-approve tfplan
 
