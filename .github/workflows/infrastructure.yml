@@ -242,10 +242,17 @@ jobs:
     name: Ansible Deployment
     runs-on: ubuntu-latest
     needs: terraform-plan
-    if: success() && needs.terraform-plan.outputs.server_ip != ''
+    if: success()
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
 
       - name: Download Terraform State
         uses: actions/download-artifact@v4
@@ -257,16 +264,42 @@ jobs:
         id: get-server-ip
         working-directory: infra/terraform
         run: |
+          # Initialize Terraform to read outputs
+          terraform init -backend=false 2>/dev/null || true
+          
+          # Try to get server IP from output
           SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
-          if [ -z "$SERVER_IP" ]; then
-            # Fallback: extract from state file
+          
+          # Fallback: extract from state file
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
+            echo "Extracting server IP from state file..."
             SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
           fi
+          
+          # Additional fallback: query AWS directly
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
+            echo "Querying AWS for server IP..."
+            INSTANCE_ID=$(grep -o '"id":"i-[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+            if [ -n "$INSTANCE_ID" ]; then
+              SERVER_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || echo "")
+            fi
+          fi
+          
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "None" ]; then
+            echo "ERROR: Could not determine server IP address"
+            exit 1
+          fi
+          
           echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
           echo "Server IP: $SERVER_IP"
 
       - name: Setup SSH
         run: |
+          if [ -z "${{ steps.get-server-ip.outputs.server_ip }}" ]; then
+            echo "ERROR: Server IP is empty. Cannot setup SSH."
+            exit 1
+          fi
+          
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
