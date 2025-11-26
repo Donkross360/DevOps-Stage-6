@@ -45,3 +45,9 @@ variable "availability_zone" {
   default     = ""
 }
 
+variable "skip_ansible_provision" {
+  description = "Skip Ansible provisioner (useful in CI/CD where workflow handles it separately)"
+  type        = bool
+  default     = false
+}
+

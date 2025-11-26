@@ -51,12 +51,7 @@ data "aws_ami" "ubuntu" {
 # Security Group
 resource "aws_security_group" "todo_app" {
   name        = "todo-app-sg"
-  name_prefix = null
   description = "Security group for TODO application"
-  
-  lifecycle {
-    create_before_destroy = true
-  }
 
   ingress {
     description = "HTTP"
@@ -195,8 +190,11 @@ resource "local_file" "ansible_inventory" {
   filename = "${path.module}/../ansible/inventory/hosts.yml"
 }
 
-# Null resource to trigger Ansible
+# Null resource to trigger Ansible (skipped in CI/CD - workflow handles it)
 resource "null_resource" "ansible_provision" {
+  # Skip in CI/CD environments - workflow handles Ansible deployment
+  count = var.skip_ansible_provision ? 0 : 1
+  
   triggers = {
     instance_id = aws_instance.todo_app.id
     inventory   = local_file.ansible_inventory.content
@@ -204,6 +202,31 @@ resource "null_resource" "ansible_provision" {
 
   provisioner "local-exec" {
     command = <<-EOT
+      echo "Waiting for EC2 instance to be ready for SSH..."
+      
+      # Wait for instance to be in running state
+      echo "Waiting for instance to reach running state..."
+      aws ec2 wait instance-running --instance-ids ${aws_instance.todo_app.id} || true
+      
+      # Wait additional time for SSH to start
+      echo "Waiting for SSH service to be available..."
+      sleep 30
+      
+      # Wait for SSH to be actually accessible
+      MAX_RETRIES=30
+      RETRY_COUNT=0
+      until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ${var.ssh_key_path} ${var.server_user}@${aws_instance.todo_app.public_ip} 'echo "SSH ready"' 2>/dev/null; do
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+          echo "WARNING: SSH connection failed after $MAX_RETRIES attempts"
+          echo "Ansible will be handled by CI/CD workflow instead"
+          exit 0  # Exit gracefully - workflow will handle it
+        fi
+        echo "Attempt $RETRY_COUNT/$MAX_RETRIES: SSH not ready yet, waiting 10 seconds..."
+        sleep 10
+      done
+      
+      echo "SSH is ready! Running Ansible..."
       cd ${path.module}/../ansible
       ansible-playbook -i inventory/hosts.yml playbook.yml
     EOT
