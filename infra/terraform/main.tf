@@ -29,7 +29,7 @@ data "aws_ami" "ubuntu" {
 
   filter {
     name   = "name"
-    values = ["ubuntu/images/hub/ubuntu-jammy-22.04-amd64-server-*"]
+    values = ["ubuntu/images/*/ubuntu-jammy-22.04-amd64-server-*"]
   }
 
   filter {
@@ -40,6 +40,11 @@ data "aws_ami" "ubuntu" {
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
   }
 }
 
