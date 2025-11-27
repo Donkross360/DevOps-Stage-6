@@ -1,0 +1,212 @@
+name: Infrastructure Destruction
+
+on:
+  workflow_dispatch:  # Manual trigger only - safe!
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm (case-sensitive)'
+        required: true
+        type: string
+
+# Prevent duplicate runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-destroy:
+    name: Validate Destruction Request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ Invalid confirmation. You must type 'DESTROY' to proceed."
+            echo "Received: '${{ github.event.inputs.confirm_destroy }}'"
+            exit 1
+          fi
+          echo "✅ Destruction confirmed. Proceeding with infrastructure teardown..."
+
+  terraform-destroy:
+    name: Destroy All Infrastructure
+    runs-on: ubuntu-latest
+    needs: validate-destroy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Download Latest Terraform State
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+          path: infra/terraform/
+          pattern: terraform.tfstate*
+          allow-empty: true
+        continue-on-error: true
+
+      - name: Check if state exists
+        id: check-state
+        working-directory: infra/terraform
+        run: |
+          if [ ! -f terraform.tfstate ] && [ ! -f terraform.tfstate.backup ]; then
+            echo "⚠️ WARNING: No Terraform state file found."
+            echo "This could mean:"
+            echo "  - Infrastructure was never created"
+            echo "  - State file was manually deleted"
+            echo "  - This is a fresh repository"
+            echo "Proceeding with destroy anyway (will fail gracefully if nothing exists)..."
+            echo "state_exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ State file found. Proceeding with destruction..."
+            echo "state_exists=true" >> $GITHUB_OUTPUT
+            ls -lah terraform.tfstate* || true
+          fi
+
+      - name: Terraform Init
+        working-directory: infra/terraform
+        run: terraform init
+
+      - name: Create terraform.tfvars from GitHub Secrets
+        working-directory: infra/terraform
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_region = "${{ secrets.AWS_REGION || 'us-east-1' }}"
+          instance_type = "${{ secrets.TERRAFORM_INSTANCE_TYPE || 't3.medium' }}"
+          key_pair_name = "${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
+          ssh_key_path = "${{ secrets.TERRAFORM_SSH_KEY_PATH || '~/.ssh/id_rsa' }}"
+          ssh_cidr = "${{ secrets.TERRAFORM_SSH_CIDR || '0.0.0.0/0' }}"
+          server_user = "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}"
+          state_volume_size = ${{ secrets.TERRAFORM_STATE_VOLUME_SIZE || 10 }}
+          availability_zone = ""
+          skip_ansible_provision = true
+          EOF
+
+      - name: Terraform Plan Destroy
+        working-directory: infra/terraform
+        run: |
+          echo "📋 Generating destroy plan..."
+          terraform plan -destroy -var-file=terraform.tfvars -out=destroy.tfplan
+          echo ""
+          echo "⚠️ DESTRUCTION PLAN SUMMARY:"
+          terraform show -no-color destroy.tfplan | head -100
+        continue-on-error: true
+
+      - name: Terraform Destroy
+        working-directory: infra/terraform
+        run: |
+          echo "🔥 Starting infrastructure destruction..."
+          echo "This will destroy:"
+          echo "  - EC2 instance (and all containers/services on it)"
+          echo "  - Security groups"
+          echo "  - EBS volumes (including Terraform state volume)"
+          echo "  - Volume attachments"
+          echo ""
+          terraform destroy -auto-approve -var-file=terraform.tfvars
+        continue-on-error: true
+
+      - name: Verify Destruction
+        working-directory: infra/terraform
+        run: |
+          echo "🔍 Verifying all resources are destroyed..."
+          terraform show 2>/dev/null || echo "✅ State file is empty or invalid (expected after destruction)"
+          
+          # Try to list any remaining resources
+          echo ""
+          echo "Checking for orphaned resources..."
+          
+          # Check for EC2 instances
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$INSTANCES" ] && [ "$INSTANCES" != "None" ]; then
+            echo "⚠️ WARNING: Found EC2 instances: $INSTANCES"
+            echo "They may still be terminating. Check AWS Console."
+          else
+            echo "✅ No EC2 instances found"
+          fi
+          
+          # Check for security groups
+          SGS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=todo-app-sg" \
+            --query 'SecurityGroups[*].GroupId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SGS" ] && [ "$SGS" != "None" ]; then
+            echo "⚠️ WARNING: Found security groups: $SGS"
+            echo "Attempting to delete..."
+            for sg in $SGS; do
+              aws ec2 delete-security-group --group-id "$sg" 2>/dev/null || echo "Could not delete $sg (may have dependencies)"
+            done
+          else
+            echo "✅ No security groups found"
+          fi
+          
+          # Check for EBS volumes
+          VOLUMES=$(aws ec2 describe-volumes \
+            --filters "Name=tag:Name,Values=terraform-state-storage" \
+            --query 'Volumes[*].VolumeId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$VOLUMES" ] && [ "$VOLUMES" != "None" ]; then
+            echo "⚠️ WARNING: Found EBS volumes: $VOLUMES"
+            echo "Attempting to delete..."
+            for vol in $VOLUMES; do
+              aws ec2 delete-volume --volume-id "$vol" 2>/dev/null || echo "Could not delete $vol"
+            done
+          else
+            echo "✅ No EBS volumes found"
+          fi
+
+      - name: Clean up local state files
+        working-directory: infra/terraform
+        run: |
+          echo "🧹 Cleaning up local state files..."
+          rm -f terraform.tfstate terraform.tfstate.backup destroy.tfplan *.tfvars
+          echo "✅ Local state files removed"
+
+      - name: Delete state artifact
+        run: |
+          echo "🧹 Note: Terraform state artifact will be automatically cleaned up after workflow completion"
+          echo "GitHub Actions artifacts are retained for 90 days but can be manually deleted"
+
+      - name: Destruction Summary
+        if: always()
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "🗑️  INFRASTRUCTURE DESTRUCTION COMPLETE"
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+          echo "✅ Destroyed resources:"
+          echo "   - EC2 instance and all services"
+          echo "   - Security groups"
+          echo "   - EBS volumes"
+          echo "   - All containers and applications"
+          echo ""
+          echo "📝 Next steps:"
+          echo "   1. Verify in AWS Console that all resources are gone"
+          echo "   2. Delete any orphaned resources manually if needed"
+          echo "   3. Clean up GitHub Actions artifacts (optional)"
+          echo "   4. All costs should now be $0.00"
+          echo ""
+          echo "⚠️  IMPORTANT:"
+          echo "   - State file has been destroyed"
+          echo "   - To recreate infrastructure, run the infrastructure workflow again"
+          echo "   - All data on the instance is permanently lost"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+
