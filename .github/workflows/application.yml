@@ -27,22 +27,61 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Get Server IP from Terraform State
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Get Server IP from AWS
         id: get-server-ip
-        working-directory: infra/terraform
         run: |
-          if [ -f terraform.tfstate ]; then
-            SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
-            if [ -z "$SERVER_IP" ]; then
-              # Fallback: extract from state file
-              SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
-            fi
-            echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
-            echo "Server IP: $SERVER_IP"
-          else
-            echo "Error: terraform.tfstate not found. Please run infrastructure workflow first."
+          echo "Finding EC2 instance by tag Name=todo-app-server..."
+          
+          # Find instance by tag (most reliable method)
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ] || [ "$INSTANCE_ID" == "null" ]; then
+            echo "ERROR: Could not find EC2 instance with tag Name=todo-app-server"
+            echo "Please ensure the infrastructure workflow has run and created the instance."
             exit 1
           fi
+          
+          echo "Found instance: $INSTANCE_ID"
+          
+          # Get public IP from AWS
+          SERVER_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "None" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "-" ]; then
+            echo "ERROR: Instance found but has no public IP address"
+            echo "Instance ID: $INSTANCE_ID"
+            exit 1
+          fi
+          
+          echo "server_ip=$SERVER_IP" >> $GITHUB_OUTPUT
+          echo "✓ Server IP: $SERVER_IP"
+
+      - name: Generate Ansible Inventory
+        run: |
+          mkdir -p infra/ansible/inventory
+          cat > infra/ansible/inventory/hosts.yml <<EOF
+          all:
+            hosts:
+              todo-app-server:
+                ansible_host: ${{ steps.get-server-ip.outputs.server_ip }}
+                ansible_user: ubuntu
+                ansible_ssh_private_key_file: ~/.ssh/id_rsa
+                ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+          EOF
+          echo "Generated inventory file:"
+          cat infra/ansible/inventory/hosts.yml
 
       - name: Setup SSH
         run: |
