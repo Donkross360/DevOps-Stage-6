@@ -147,6 +147,59 @@ jobs:
             echo "null_resource.ansible_provision not in state or already removed"
         continue-on-error: true
 
+      - name: Detect Terraform File Changes
+        id: terraform-files-check
+        run: |
+          echo "Checking if Terraform files changed in this commit/PR..."
+          
+          TERRAFORM_FILES_CHANGED=""
+          
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For PRs, compare with base branch
+            BASE_REF="${{ github.event.pull_request.base.ref }}"
+            HEAD_REF="${{ github.event.pull_request.head.ref }}"
+            echo "PR: Comparing $HEAD_REF with $BASE_REF"
+            
+            # Fetch base branch to compare
+            git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+            
+            TERRAFORM_FILES_CHANGED=$(git diff --name-only "origin/$BASE_REF" "$HEAD_REF" 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            # For pushes, compare with previous commit
+            if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              BEFORE="${{ github.event.before }}"
+              AFTER="${{ github.sha }}"
+              echo "Push: Comparing $BEFORE with $AFTER"
+              TERRAFORM_FILES_CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+            else
+              # First commit or no before commit, check all Terraform files
+              echo "First commit or no previous commit - checking all Terraform files"
+              TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+              if [ -z "$TERRAFORM_FILES_CHANGED" ]; then
+                # If that fails, assume files changed (safer for first run)
+                TERRAFORM_FILES_CHANGED="infra/terraform/"
+              fi
+            fi
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # For manual runs, compare with last commit on same branch
+            echo "Manual workflow dispatch: Comparing with last commit"
+            TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+          fi
+          
+          if [ -n "$TERRAFORM_FILES_CHANGED" ]; then
+            echo "✅ Terraform files changed:"
+            echo "$TERRAFORM_FILES_CHANGED" | sed 's/^/  - /'
+            echo "terraform_files_changed=true" >> $GITHUB_OUTPUT
+            {
+              echo "changed_files<<EOF"
+              echo "$TERRAFORM_FILES_CHANGED"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  No Terraform files changed in this commit/PR"
+            echo "terraform_files_changed=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Terraform Plan
         working-directory: infra/terraform
         run: terraform plan -out=tfplan -var-file=terraform.tfvars
@@ -161,15 +214,28 @@ jobs:
             echo "First run detected - no existing state"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=true" >> $GITHUB_OUTPUT
+            echo "change_type=first_run" >> $GITHUB_OUTPUT
           elif terraform show -no-color tfplan | grep -q "No changes"; then
-            echo "No drift detected"
+            echo "No changes detected - infrastructure is in sync"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=none" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.terraform-files-check.outputs.terraform_files_changed }}" == "true" ]; then
+            echo "Terraform files were modified - these are expected changes, not drift"
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=expected" >> $GITHUB_OUTPUT
+            terraform show -no-color tfplan > change_summary.txt
+            echo "📝 Change summary saved (expected changes from code updates)"
           else
-            echo "Drift detected - existing infrastructure has changes"
+            echo "🚨 REAL DRIFT DETECTED - Infrastructure changed outside Terraform!"
+            echo "Terraform files did NOT change, but plan shows changes."
+            echo "This means infrastructure was modified manually or by another process."
             echo "drift_detected=true" >> $GITHUB_OUTPUT
             echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=drift" >> $GITHUB_OUTPUT
             terraform show -no-color tfplan > drift_summary.txt
+            echo "🚨 Drift summary saved - requires immediate attention"
           fi
 
       - name: Get Server IP from State
@@ -187,9 +253,10 @@ jobs:
             echo "server_ip=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Send Drift Email
-        if: steps.drift-check.outputs.drift_detected == 'true'
+      - name: Send Drift Email (Real Drift Only)
+        if: steps.drift-check.outputs.change_type == 'drift'
         run: |
+          echo "🚨 Sending drift alert email..."
           chmod +x ./infra/ci-cd/scripts/email-notification.sh
           ./infra/ci-cd/scripts/email-notification.sh "$(cat infra/terraform/drift_summary.txt)"
         env:
@@ -197,37 +264,76 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
-      - name: Manual Approval (skip on first run or if Issues disabled)
-        if: steps.drift-check.outputs.drift_detected == 'true' && steps.drift-check.outputs.is_first_run != 'true'
+      - name: Log Expected Changes
+        if: steps.drift-check.outputs.change_type == 'expected'
+        run: |
+          echo "ℹ️  Expected changes detected (Terraform files were modified)"
+          echo "Proceeding with deployment without drift alert..."
+          echo ""
+          echo "Changes will be applied:"
+          echo "---"
+          head -50 infra/terraform/change_summary.txt || echo "Change summary not available"
+
+      - name: Manual Approval for Real Drift (Only)
+        if: steps.drift-check.outputs.change_type == 'drift'
         uses: trstringer/manual-approval@v1
         with:
           secret: ${{ github.TOKEN }}
           approvers: ${{ github.actor }}
           minimum-approvals: 1
-          issue-title: "Terraform Drift Detected - Approval Required"
+          issue-title: "🚨 REAL DRIFT DETECTED - Infrastructure Changed Outside Terraform"
           issue-body: |
-            Terraform drift has been detected. Please review the plan and approve.
+            **⚠️ CRITICAL: Real Infrastructure Drift Detected**
             
-            Plan Summary:
+            Infrastructure has been modified **outside of Terraform**. This is unexpected and requires investigation.
+            
+            **What happened:**
+            - Terraform code files were **NOT modified**
+            - But infrastructure plan shows changes
+            - This indicates manual changes or changes from another process
+            
+            **Action Required:**
+            1. Review the plan below
+            2. Investigate what caused the drift
+            3. Approve if changes are intentional, or revert if unauthorized
+            
+            **Plan Summary:**
             ```
             ${{ steps.drift-check.outputs.drift_summary }}
             ```
+            
+            **Note:** No Terraform files were changed in this commit, confirming this is real drift.
+            
+            **Next Steps:**
+            - Approve to apply these changes
+            - Or investigate and revert unauthorized changes
           issue-create-on-fail: false
         continue-on-error: true
         id: manual-approval
 
       - name: Log first run
-        if: steps.drift-check.outputs.is_first_run == 'true'
+        if: steps.drift-check.outputs.change_type == 'first_run'
         run: |
-          echo "First infrastructure deployment - proceeding without approval"
+          echo "✅ First infrastructure deployment - proceeding without approval"
 
       - name: Terraform Apply
         if: |
-          steps.drift-check.outputs.drift_detected != 'true' || 
-          steps.drift-check.outputs.is_first_run == 'true' ||
-          (steps.drift-check.outputs.drift_detected == 'true' && steps.drift-check.outputs.is_first_run != 'true' && steps.manual-approval.outcome == 'success')
+          steps.drift-check.outputs.change_type == 'first_run' ||
+          steps.drift-check.outputs.change_type == 'none' ||
+          steps.drift-check.outputs.change_type == 'expected' ||
+          (steps.drift-check.outputs.change_type == 'drift' && steps.manual-approval.outcome == 'success')
         working-directory: infra/terraform
-        run: terraform apply -auto-approve tfplan
+        run: |
+          if [ "${{ steps.drift-check.outputs.change_type }}" == "drift" ]; then
+            echo "⚠️  Applying changes after drift approval..."
+          elif [ "${{ steps.drift-check.outputs.change_type }}" == "expected" ]; then
+            echo "✅ Applying expected changes from Terraform code updates..."
+          elif [ "${{ steps.drift-check.outputs.change_type }}" == "first_run" ]; then
+            echo "🚀 Applying first infrastructure deployment..."
+          else
+            echo "ℹ️  No changes to apply"
+          fi
+          terraform apply -auto-approve tfplan
 
       - name: Upload Terraform State
         if: always()
