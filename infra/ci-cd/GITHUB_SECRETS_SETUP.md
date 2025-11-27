@@ -68,16 +68,60 @@ Go to: **Repository → Settings → Secrets and variables → Actions → New r
 
 ### 3. Email Notification (Optional - for Drift Detection)
 
-#### `EMAIL_TO`
+#### `EMAIL_TO` (Optional - for email notifications)
 - **Description**: Email address to receive Terraform drift notifications
 - **Example**: `your-email@example.com`
+- **Note**: Must be verified in AWS SES if SES is in sandbox mode
 
-#### `SMTP_USER` (Optional)
-- **Description**: SMTP username for sending emails (if using SMTP)
-- **Note**: Currently, email notification uses GitHub API. SMTP support can be added if needed.
+#### `EMAIL_FROM` (Optional - for email notifications)
+- **Description**: Email address to send from (must be verified in AWS SES)
+- **How to verify in AWS SES**:
+  1. Go to AWS Console → SES → Verified identities
+  2. Click "Create identity"
+  3. Choose "Email address"
+  4. Enter your email address
+  5. Click "Create identity"
+  6. Check your email inbox and click the verification link
+  7. Copy your verified email address
+- **Example**: `your-email@example.com`
+- **Important**: This email MUST be verified in AWS SES before emails can be sent
 
-#### `SMTP_PASS` (Optional)
-- **Description**: SMTP password for sending emails
+---
+
+## Email Configuration (AWS SES - Free Tier)
+
+We use **AWS SES (Simple Email Service)** for email notifications:
+- ✅ **Free**: 62,000 emails/month free tier
+- ✅ **No additional signups**: Uses your existing AWS account
+- ✅ **Integrated**: Already using AWS for infrastructure
+- ✅ **Reliable**: Managed by AWS
+
+### Setup Steps:
+
+1. **Verify sender email in AWS SES**:
+   - Go to: AWS Console → SES → Verified identities
+   - Click "Create identity" → Choose "Email address"
+   - Enter your email → Click "Create identity"
+   - Check your email and click the verification link
+
+2. **Verify recipient email** (only if SES is in sandbox mode):
+   - Repeat step 1 for your recipient email
+   - **Note**: In sandbox mode, you can only send to verified emails
+   - To send to any email: Request production access in SES dashboard
+
+3. **Set GitHub Secrets**:
+   - `EMAIL_TO`: Email address to receive notifications
+   - `EMAIL_FROM`: Your verified email in AWS SES
+
+That's it! Uses your existing AWS credentials (already configured).
+
+### AWS SES Sandbox Mode:
+
+- **Sandbox mode** (default): Can only send to verified email addresses
+  - Both `EMAIL_FROM` and `EMAIL_TO` must be verified initially
+- **Production access**: Can send to any email address
+  - Request in SES → Account dashboard → "Request production access"
+  - Usually approved within 24 hours
 
 ---
 
@@ -103,10 +147,15 @@ Go to: **Repository → Settings → Secrets and variables → Actions → New r
 
 ## Quick Checklist
 
+### Required Secrets:
 - [ ] `AWS_ACCESS_KEY_ID` - AWS access key
 - [ ] `AWS_SECRET_ACCESS_KEY` - AWS secret key
-- [ ] `AWS_REGION` - AWS region (optional, defaults to us-east-1)
+- [ ] `TERRAFORM_KEY_PAIR_NAME` - AWS Key Pair name
 - [ ] `SSH_PRIVATE_KEY` - SSH private key matching your AWS Key Pair
+
+### Optional Secrets (for email notifications):
+- [ ] `EMAIL_TO` - Email address to receive drift notifications
+- [ ] `EMAIL_FROM` - Verified email in AWS SES (to send from)
 
 ---
 
@@ -164,4 +213,12 @@ After setting up secrets, you can test them by:
 ### "terraform.tfstate not found" in Application workflow
 - Run the Infrastructure workflow first to create the EC2 instance
 - The Application workflow depends on Terraform state
+
+### Email not sending
+- **Verify emails in AWS SES**: Both `EMAIL_FROM` and `EMAIL_TO` must be verified if in sandbox mode
+- **Check sandbox mode**: In AWS SES dashboard, check if you're in sandbox (can only send to verified emails)
+- **Request production access**: To send to any email, request production access in SES dashboard
+- **Check workflow logs**: Look for email sending errors in "Send Drift Email" step
+- **Verify AWS credentials**: Ensure AWS credentials have SES permissions
+- **Test email**: Try sending a test email manually via AWS CLI: `aws ses send-email --from your@email.com --to your@email.com --subject "Test" --text "Test"`
 

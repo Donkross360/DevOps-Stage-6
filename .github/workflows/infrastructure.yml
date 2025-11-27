@@ -261,8 +261,8 @@ jobs:
           ./infra/ci-cd/scripts/email-notification.sh "$(cat infra/terraform/drift_summary.txt)"
         env:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
 
       - name: Log Expected Changes
         if: steps.drift-check.outputs.change_type == 'expected'
