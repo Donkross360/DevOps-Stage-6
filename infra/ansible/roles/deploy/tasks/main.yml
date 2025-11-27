@@ -82,26 +82,23 @@
     mode: '0600'
 
 - name: Check if docker-compose is running
-  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" ps
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" ps
   register: compose_status
   changed_when: false
   failed_when: false
-  become_user: "{{ app_user }}"
   args:
     chdir: "{{ app_dir }}"
 
 - name: Stop existing containers
-  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" down
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" down
   args:
     chdir: "{{ app_dir }}"
-  become_user: "{{ app_user }}"
   when: compose_status.rc == 0
 
 - name: Build and start containers
-  shell: docker compose -f "{{ app_dir }}/docker-compose.yml" up -d --build
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" up -d --build
   args:
     chdir: "{{ app_dir }}"
-  become_user: "{{ app_user }}"
   register: compose_up_result
   notify: verify deployment
 
