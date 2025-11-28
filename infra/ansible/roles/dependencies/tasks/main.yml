@@ -18,16 +18,6 @@
       - lsb-release
     state: present
 
-- name: Add Docker GPG key
-  apt_key:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    state: present
-
-- name: Add Docker repository
-  apt_repository:
-    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-    state: present
-
 - name: Check if Docker is already installed
   command: docker --version
   register: docker_check
@@ -45,34 +35,76 @@
     msg: "Docker is not installed, will install now"
   when: docker_check.rc != 0
 
+- name: Stop unattended-upgrades if running
+  systemd:
+    name: unattended-upgrades
+    state: stopped
+  ignore_errors: yes
+  when: docker_check.rc != 0  # Only stop if Docker is not installed
+
 - name: Wait for any running apt processes to finish
   shell: |
     timeout=120
     elapsed=0
     while [ $elapsed -lt $timeout ]; do
+      # Check for apt processes
       if ! pgrep -x apt >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
-        echo "No apt processes running"
-        exit 0
+        # Check for lock files
+        if [ ! -f /var/lib/dpkg/lock-frontend ] && [ ! -f /var/lib/dpkg/lock ] && [ ! -f /var/cache/apt/archives/lock ]; then
+          echo "No apt processes or locks found"
+          exit 0
+        fi
+        # If lock files exist but no processes, they might be stale - wait a bit more
+        if [ $elapsed -gt 10 ]; then
+          echo "Lock files exist but no processes, removing stale locks..."
+          rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+          echo "Stale locks removed, proceeding..."
+          exit 0
+        fi
       fi
       echo "Waiting for apt processes to finish... ($elapsed/$timeout seconds)"
       sleep 2
       elapsed=$((elapsed + 2))
     done
-    echo "Timeout waiting for apt processes, proceeding anyway..."
+    echo "Timeout waiting for apt processes, removing locks and proceeding..."
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
     exit 0
   register: wait_for_apt
   changed_when: false
   failed_when: false
   when: docker_check.rc != 0  # Only wait if Docker is not installed
 
+- name: Add Docker GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+  when: docker_check.rc != 0  # Only add if Docker is not installed
+
+- name: Add Docker repository (manual method to avoid automatic cache update)
+  lineinfile:
+    path: /etc/apt/sources.list.d/docker.list
+    line: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    create: yes
+    mode: '0644'
+  when: docker_check.rc != 0  # Only add if Docker is not installed
+
 - name: Update apt cache after adding Docker repository
-  apt:
-    update_cache: yes
-    cache_valid_time: 3600
-  retries: 5
-  delay: 10
+  shell: |
+    # Try apt-get update with better error handling
+    for i in {1..5}; do
+      if apt-get update -qq 2>&1; then
+        echo "Apt cache updated successfully"
+        exit 0
+      fi
+      echo "Attempt $i/5 failed, waiting 10 seconds..."
+      sleep 10
+    done
+    echo "Failed to update apt cache after 5 attempts"
+    exit 1
   register: apt_update_result
-  until: apt_update_result is succeeded
+  changed_when: "'updated' in apt_update_result.stdout or 'upgraded' in apt_update_result.stdout"
+  failed_when: apt_update_result.rc != 0
   when: docker_check.rc != 0  # Only update cache if Docker is not installed
 
 - name: Install Docker

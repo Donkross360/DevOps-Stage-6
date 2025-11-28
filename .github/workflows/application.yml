@@ -91,9 +91,17 @@ jobs:
           ssh-keyscan -H ${{ steps.get-server-ip.outputs.server_ip }} >> ~/.ssh/known_hosts
 
       - name: Install Ansible
+        # Ansible is required for deployment, but GitHub Actions runners are ephemeral
+        # so we need to install it each time. However, we can optimize by checking
+        # if it's already available (though unlikely on fresh runners).
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ansible
+          if ! command -v ansible &> /dev/null; then
+            echo "Installing Ansible..."
+            sudo apt-get update -qq
+            sudo apt-get install -y ansible
+          else
+            echo "Ansible already installed: $(ansible --version | head -1)"
+          fi
 
       - name: Deploy Application
         run: |
