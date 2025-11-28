@@ -78,52 +78,6 @@ jobs:
         working-directory: infra/terraform
         run: terraform init
 
-      - name: Import existing resources if state is missing
-        if: steps.check-state.outputs.state_exists == 'false'
-        working-directory: infra/terraform
-        run: |
-          echo "⚠️  State file missing. Attempting to import existing resources..."
-          
-          # Import security group
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=todo-app-sg" \
-            --query 'SecurityGroups[0].GroupId' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
-            echo "Importing security group: $SG_ID"
-            terraform import aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
-          fi
-          
-          # Import EC2 instance (get the most recent one if multiple exist)
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
-            --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
-            --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
-          
-          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
-            echo "Importing EC2 instance: $INSTANCE_ID"
-            terraform import aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
-            
-            # Import EBS volume
-            VOL_ID=$(aws ec2 describe-volumes \
-              --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
-              --query 'Volumes[0].VolumeId' \
-              --output text 2>/dev/null || echo "")
-            
-            if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
-              echo "Importing EBS volume: $VOL_ID"
-              terraform import aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
-              
-              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
-              echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-              terraform import aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
-            fi
-          fi
-          
-          echo "✅ Import complete. Proceeding with destroy..."
-        continue-on-error: true
-
       - name: Create terraform.tfvars from GitHub Secrets
         working-directory: infra/terraform
         run: |
@@ -138,6 +92,52 @@ jobs:
           availability_zone = ""
           skip_ansible_provision = true
           EOF
+
+      - name: Import existing resources if state is missing
+        if: steps.check-state.outputs.state_exists == 'false'
+        working-directory: infra/terraform
+        run: |
+          echo "⚠️  State file missing. Attempting to import existing resources..."
+          
+          # Import security group
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=todo-app-sg" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            echo "Importing security group: $SG_ID"
+            terraform import -var-file=terraform.tfvars aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
+          fi
+          
+          # Import EC2 instance (get the most recent one if multiple exist)
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
+            --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
+          
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "Importing EC2 instance: $INSTANCE_ID"
+            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
+            
+            # Import EBS volume
+            VOL_ID=$(aws ec2 describe-volumes \
+              --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
+              --query 'Volumes[0].VolumeId' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
+              echo "Importing EBS volume: $VOL_ID"
+              terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
+              
+              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
+              echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
+              terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
+            fi
+          fi
+          
+          echo "✅ Import complete. Proceeding with destroy..."
+        continue-on-error: true
 
       - name: Terraform Plan Destroy
         working-directory: infra/terraform
