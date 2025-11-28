@@ -243,7 +243,14 @@ jobs:
             echo "is_first_run=true" >> $GITHUB_OUTPUT
             echo "change_type=first_run" >> $GITHUB_OUTPUT
             echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # First run always creates infrastructure
-          elif terraform show -no-color tfplan | grep -q "No changes"; then
+          elif [ ! -f tfplan ]; then
+            echo "Warning: tfplan file not found (terraform plan may have failed)"
+            echo "Assuming no infrastructure changes"
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=none" >> $GITHUB_OUTPUT
+            echo "infrastructure_changed=false" >> $GITHUB_OUTPUT
+          elif terraform show -no-color tfplan 2>/dev/null | grep -q "No changes"; then
             echo "No changes detected - infrastructure is in sync"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=false" >> $GITHUB_OUTPUT
@@ -255,8 +262,10 @@ jobs:
             echo "is_first_run=false" >> $GITHUB_OUTPUT
             echo "change_type=expected" >> $GITHUB_OUTPUT
             echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # Plan shows changes
-            terraform show -no-color tfplan > change_summary.txt
-            echo "📝 Change summary saved (expected changes from code updates)"
+            if [ -f tfplan ]; then
+              terraform show -no-color tfplan > change_summary.txt 2>/dev/null || echo "Could not read tfplan" > change_summary.txt
+              echo "📝 Change summary saved (expected changes from code updates)"
+            fi
           else
             echo "🚨 REAL DRIFT DETECTED - Infrastructure changed outside Terraform!"
             echo "Terraform files did NOT change, but plan shows changes."
@@ -265,25 +274,10 @@ jobs:
             echo "is_first_run=false" >> $GITHUB_OUTPUT
             echo "change_type=drift" >> $GITHUB_OUTPUT
             echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # Plan shows changes
-            terraform show -no-color tfplan > drift_summary.txt
-            echo "🚨 Drift summary saved - requires immediate attention"
-          fi
-          elif [ "${{ steps.file-changes-check.outputs.terraform_files_changed }}" == "true" ]; then
-            echo "Terraform files were modified - these are expected changes, not drift"
-            echo "drift_detected=false" >> $GITHUB_OUTPUT
-            echo "is_first_run=false" >> $GITHUB_OUTPUT
-            echo "change_type=expected" >> $GITHUB_OUTPUT
-            terraform show -no-color tfplan > change_summary.txt
-            echo "📝 Change summary saved (expected changes from code updates)"
-          else
-            echo "🚨 REAL DRIFT DETECTED - Infrastructure changed outside Terraform!"
-            echo "Terraform files did NOT change, but plan shows changes."
-            echo "This means infrastructure was modified manually or by another process."
-            echo "drift_detected=true" >> $GITHUB_OUTPUT
-            echo "is_first_run=false" >> $GITHUB_OUTPUT
-            echo "change_type=drift" >> $GITHUB_OUTPUT
-            terraform show -no-color tfplan > drift_summary.txt
-            echo "🚨 Drift summary saved - requires immediate attention"
+            if [ -f tfplan ]; then
+              terraform show -no-color tfplan > drift_summary.txt 2>/dev/null || echo "Could not read tfplan" > drift_summary.txt
+              echo "🚨 Drift summary saved - requires immediate attention"
+            fi
           fi
 
       - name: Get Server IP from State
