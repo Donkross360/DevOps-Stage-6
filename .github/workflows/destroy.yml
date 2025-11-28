@@ -92,7 +92,7 @@ jobs:
           
           if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
             echo "Importing security group: $SG_ID"
-            terraform import -var-file=terraform.tfvars aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
+            terraform import aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
           fi
           
           # Import EC2 instance (get the most recent one if multiple exist)
@@ -103,7 +103,7 @@ jobs:
           
           if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
             echo "Importing EC2 instance: $INSTANCE_ID"
-            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
+            terraform import aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
             
             # Import EBS volume
             VOL_ID=$(aws ec2 describe-volumes \
@@ -113,11 +113,11 @@ jobs:
             
             if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
               echo "Importing EBS volume: $VOL_ID"
-              terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
+              terraform import aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
               
               DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
               echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-              terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
+              terraform import aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
             fi
           fi
           
