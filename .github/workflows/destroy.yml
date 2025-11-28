@@ -47,7 +47,99 @@ jobs:
         with:
           terraform_version: 1.5.0
 
-      - name: Download Latest Terraform State
+      - name: Determine backend configuration and state location
+        id: backend-check
+        working-directory: infra/terraform
+        run: |
+          echo "🔍 Analyzing backend configuration to determine state location..."
+          
+          # Check backend.tf to determine where state should be stored
+          if grep -q 'backend "local"' backend.tf && grep -q 'path = "/mnt/terraform-state' backend.tf; then
+            echo "Backend: Local on EBS volume (/mnt/terraform-state/terraform.tfstate)"
+            echo "backend_type=ebs" >> $GITHUB_OUTPUT
+            echo "state_path=/mnt/terraform-state/terraform.tfstate" >> $GITHUB_OUTPUT
+          elif grep -q 'backend "s3"' backend.tf; then
+            echo "Backend: S3 remote backend"
+            echo "backend_type=s3" >> $GITHUB_OUTPUT
+            # Extract bucket and key from backend.tf if needed
+            BUCKET=$(grep -A 5 'backend "s3"' backend.tf | grep 'bucket' | sed 's/.*bucket.*=.*"\([^"]*\)".*/\1/' || echo "")
+            KEY=$(grep -A 5 'backend "s3"' backend.tf | grep 'key' | sed 's/.*key.*=.*"\([^"]*\)".*/\1/' || echo "")
+            echo "state_bucket=$BUCKET" >> $GITHUB_OUTPUT
+            echo "state_key=$KEY" >> $GITHUB_OUTPUT
+          else
+            echo "Backend: Local in CI/CD runner (terraform.tfstate)"
+            echo "backend_type=local" >> $GITHUB_OUTPUT
+            echo "state_path=terraform.tfstate" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch state based on backend configuration
+        id: fetch-state
+        working-directory: infra/terraform
+        run: |
+          BACKEND_TYPE="${{ steps.backend-check.outputs.backend_type }}"
+          
+          if [ "$BACKEND_TYPE" == "ebs" ]; then
+            echo "📥 Backend is EBS-mounted. Fetching state from server..."
+            
+            # Get server IP from AWS
+            INSTANCE_ID=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
+              --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
+            
+            if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+              echo "⚠️  No instance found. Cannot fetch state from EBS volume."
+              echo "state_fetched=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            SERVER_IP=$(aws ec2 describe-instances \
+              --instance-ids "$INSTANCE_ID" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "None" ]; then
+              echo "⚠️  Instance has no public IP. Cannot fetch state."
+              echo "state_fetched=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            echo "Found instance $INSTANCE_ID at $SERVER_IP"
+            
+            # Setup SSH
+            mkdir -p ~/.ssh
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+            ssh-keyscan -H "$SERVER_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+            
+            # Fetch state file from EBS volume
+            if scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
+              "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}@$SERVER_IP:/mnt/terraform-state/terraform.tfstate" \
+              terraform.tfstate 2>/dev/null; then
+              echo "✅ Successfully fetched state file from EBS volume!"
+              ls -lah terraform.tfstate
+              echo "state_fetched=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  Could not fetch state file from EBS volume"
+              echo "state_fetched=false" >> $GITHUB_OUTPUT
+            fi
+            
+          elif [ "$BACKEND_TYPE" == "s3" ]; then
+            echo "📥 Backend is S3. State will be fetched during terraform init."
+            echo "state_fetched=init" >> $GITHUB_OUTPUT
+            
+          else
+            echo "📥 Backend is local. Checking GitHub Actions artifacts..."
+            
+            # Try to download from artifacts
+            # Note: This step runs before terraform init, so we manually download
+            echo "Attempting to download state from artifacts..."
+            echo "state_fetched=artifacts" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Download state from artifacts (for local backend)
+        if: steps.backend-check.outputs.backend_type == 'local'
         uses: actions/download-artifact@v4
         with:
           name: terraform-state
@@ -56,22 +148,21 @@ jobs:
           allow-empty: true
         continue-on-error: true
 
-      - name: Check if state exists
-        id: check-state
+      - name: Verify state file exists
+        id: verify-state
         working-directory: infra/terraform
         run: |
-          if [ ! -f terraform.tfstate ] && [ ! -f terraform.tfstate.backup ]; then
-            echo "⚠️ WARNING: No Terraform state file found."
+          if [ -f terraform.tfstate ] || [ -f terraform.tfstate.backup ]; then
+            echo "✅ State file found"
+            echo "state_exists=true" >> $GITHUB_OUTPUT
+            ls -lah terraform.tfstate* || true
+          else
+            echo "⚠️  No state file found"
             echo "This could mean:"
             echo "  - Infrastructure was never created"
             echo "  - State file was manually deleted"
-            echo "  - This is a fresh repository"
-            echo "Proceeding with destroy anyway (will fail gracefully if nothing exists)..."
+            echo "  - State is in remote backend (S3) and will be fetched during init"
             echo "state_exists=false" >> $GITHUB_OUTPUT
-          else
-            echo "✅ State file found. Proceeding with destruction..."
-            echo "state_exists=true" >> $GITHUB_OUTPUT
-            ls -lah terraform.tfstate* || true
           fi
 
       - name: Terraform Init
@@ -94,7 +185,7 @@ jobs:
           EOF
 
       - name: Import existing resources if state is missing
-        if: steps.check-state.outputs.state_exists == 'false'
+        if: steps.verify-state.outputs.state_exists == 'false'
         working-directory: infra/terraform
         run: |
           echo "⚠️  State file missing. Attempting to import existing resources..."
