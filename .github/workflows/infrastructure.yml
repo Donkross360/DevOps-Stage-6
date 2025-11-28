@@ -98,48 +98,127 @@ jobs:
           fi
         continue-on-error: true
 
+      - name: Check for duplicate instances
+        working-directory: infra/terraform
+        run: |
+          # Check for multiple instances with the same tag
+          INSTANCE_COUNT=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'length(Reservations[*].Instances[*])' \
+            --output text 2>/dev/null || echo "0")
+          
+          if [ "$INSTANCE_COUNT" -gt 1 ]; then
+            echo "⚠️  WARNING: Found $INSTANCE_COUNT instances with tag Name=todo-app-server!"
+            echo ""
+            echo "This indicates duplicate instances. Listing all instances:"
+            aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime,PublicIpAddress]' \
+              --output table 2>/dev/null || true
+            echo ""
+            echo "Possible causes:"
+            echo "1. Terraform lifecycle 'create_before_destroy' created a new instance"
+            echo "2. Import failed previously, causing Terraform to create a duplicate"
+            echo "3. Manual instance creation outside of Terraform"
+            echo ""
+            echo "The import step will attempt to import the most recent instance."
+            echo "You may need to manually terminate the older duplicate instance(s)."
+          elif [ "$INSTANCE_COUNT" -eq 1 ]; then
+            echo "✅ Found exactly 1 instance (expected)"
+          else
+            echo "ℹ️  No existing instances found (first run)"
+          fi
+        continue-on-error: true
+
       - name: Import existing EC2 instance (if exists)
         working-directory: infra/terraform
         run: |
-          # Try to find existing EC2 instance by tag Name=todo-app-server
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping" \
-            --query 'Reservations[0].Instances[0].InstanceId' \
+          # Check for ALL instances with the tag (not just the first one)
+          ALL_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime]' \
             --output text 2>/dev/null || echo "")
           
-          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
-            echo "Found existing EC2 instance: $INSTANCE_ID"
-            # Check if already in state
-            if ! terraform state show aws_instance.todo_app 2>/dev/null; then
-              echo "Importing existing EC2 instance into Terraform state..."
-              terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || echo "Import failed, will create new one"
-              
-              # Also check for and import associated EBS volume if it exists
-              echo "Checking for associated EBS volume..."
-              VOL_ID=$(aws ec2 describe-volumes \
-                --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
-                --query 'Volumes[0].VolumeId' \
-                --output text 2>/dev/null || echo "")
-              
-              if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
-                echo "Found associated EBS volume: $VOL_ID"
-                # Import EBS volume if not in state
-                if ! terraform state show aws_ebs_volume.terraform_state 2>/dev/null; then
-                  echo "Importing EBS volume into Terraform state..."
-                  terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
-                fi
-                # Import volume attachment format: <volume_id>:<instance_id>:<device>
-                if ! terraform state show aws_volume_attachment.terraform_state 2>/dev/null; then
-                  DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
-                  echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-                  terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
-                fi
-              fi
-            else
-              echo "EC2 instance already in Terraform state"
-            fi
-          else
+          if [ -z "$ALL_INSTANCES" ]; then
             echo "No existing EC2 instance found"
+            exit 0
+          fi
+          
+          # Count instances
+          INSTANCE_COUNT=$(echo "$ALL_INSTANCES" | wc -l | tr -d ' ')
+          
+          if [ "$INSTANCE_COUNT" -gt 1 ]; then
+            echo "⚠️  WARNING: Found $INSTANCE_COUNT instances with tag Name=todo-app-server!"
+            echo "This might indicate duplicate instances. Listing all instances:"
+            echo "$ALL_INSTANCES" | while read INSTANCE_ID STATE LAUNCH_TIME; do
+              echo "  - Instance ID: $INSTANCE_ID, State: $STATE, Launch Time: $LAUNCH_TIME"
+            done
+            echo ""
+            echo "Selecting the most recent RUNNING instance, or oldest if none are running..."
+          fi
+          
+          # Try to find existing EC2 instance by tag Name=todo-app-server
+          # Prefer running instances, then stopped, then others
+          # Get the most recent one
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime]' \
+            --output text 2>/dev/null | \
+            sort -k3 -r | \
+            awk '{print $1}' | \
+            head -1 || echo "")
+          
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+            echo "No valid EC2 instance found to import"
+            exit 0
+          fi
+          
+          echo "Found existing EC2 instance: $INSTANCE_ID"
+          
+          # Check if already in state
+          if terraform state show aws_instance.todo_app 2>/dev/null | grep -q "id.*=.*$INSTANCE_ID"; then
+            echo "EC2 instance $INSTANCE_ID is already in Terraform state"
+          elif terraform state show aws_instance.todo_app 2>/dev/null; then
+            echo "⚠️  WARNING: Terraform state contains a different instance ID!"
+            echo "This might cause Terraform to create a duplicate instance."
+            echo "Current state instance: $(terraform state show aws_instance.todo_app 2>/dev/null | grep '^id' | awk '{print $3}' || echo 'unknown')"
+            echo "Found instance: $INSTANCE_ID"
+            echo ""
+            echo "Attempting to import the found instance anyway..."
+            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || {
+              echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
+              echo "Please manually resolve the duplicate instances before proceeding."
+              exit 1
+            }
+          else
+            echo "Importing existing EC2 instance into Terraform state..."
+            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || {
+              echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
+              echo "Please check AWS console and manually resolve before proceeding."
+              exit 1
+            }
+          fi
+          
+          # Also check for and import associated EBS volume if it exists
+          echo "Checking for associated EBS volume..."
+          VOL_ID=$(aws ec2 describe-volumes \
+            --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
+            --query 'Volumes[0].VolumeId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
+            echo "Found associated EBS volume: $VOL_ID"
+            # Import EBS volume if not in state
+            if ! terraform state show aws_ebs_volume.terraform_state 2>/dev/null; then
+              echo "Importing EBS volume into Terraform state..."
+              terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed (non-critical)"
+            fi
+            # Import volume attachment format: <volume_id>:<instance_id>:<device>
+            if ! terraform state show aws_volume_attachment.terraform_state 2>/dev/null; then
+              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
+              echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
+              terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed (non-critical)"
+            fi
           fi
         continue-on-error: true
 
@@ -383,7 +462,7 @@ jobs:
         with:
           name: terraform-state
           path: infra/terraform/terraform.tfstate
-          retention-days: 1
+          retention-days: 90  # Increased from 1 to 90 days to prevent state loss
           if-no-files-found: ignore
 
   ansible-deploy:
