@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Fetch at least 2 commits to enable diff with previous commit
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -170,7 +172,18 @@ jobs:
               BEFORE="${{ github.event.before }}"
               AFTER="${{ github.sha }}"
               echo "Push: Comparing $BEFORE with $AFTER"
+              
+              # Fetch the before commit if not available (for shallow clones)
+              git fetch origin "$BEFORE" --depth=1 2>/dev/null || true
+              
+              # Try diff with commit hashes first
               TERRAFORM_FILES_CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+              
+              # If that failed, try with HEAD~1 (fallback for shallow clones)
+              if [ -z "$TERRAFORM_FILES_CHANGED" ]; then
+                echo "Warning: Could not diff with $BEFORE, trying HEAD~1 as fallback"
+                TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+              fi
             else
               # First commit or no before commit, check all Terraform files
               echo "First commit or no previous commit - checking all Terraform files"
