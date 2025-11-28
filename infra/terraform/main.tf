@@ -172,7 +172,7 @@ resource "aws_instance" "todo_app" {
   EOF
 
   tags = {
-    Name        = "todo-server"
+    Name        = "todo-app-server"
     Environment = "production"
     Project     = "hngi13-stage6"
   }

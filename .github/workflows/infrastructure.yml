@@ -23,6 +23,9 @@ jobs:
     outputs:
       drift_detected: ${{ steps.drift-check.outputs.drift_detected }}
       server_ip: ${{ steps.get-server-ip.outputs.server_ip }}
+      ansible_files_changed: ${{ steps.file-changes-check.outputs.ansible_files_changed }}
+      infrastructure_changed: ${{ steps.drift-check.outputs.infrastructure_changed }}
+      change_type: ${{ steps.drift-check.outputs.change_type }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -149,12 +152,13 @@ jobs:
             echo "null_resource.ansible_provision not in state or already removed"
         continue-on-error: true
 
-      - name: Detect Terraform File Changes
-        id: terraform-files-check
+      - name: Detect File Changes
+        id: file-changes-check
         run: |
-          echo "Checking if Terraform files changed in this commit/PR..."
+          echo "Checking if Terraform or Ansible files changed in this commit/PR..."
           
           TERRAFORM_FILES_CHANGED=""
+          ANSIBLE_FILES_CHANGED=""
           
           if [ "${{ github.event_name }}" == "pull_request" ]; then
             # For PRs, compare with base branch
@@ -166,6 +170,7 @@ jobs:
             git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
             
             TERRAFORM_FILES_CHANGED=$(git diff --name-only "origin/$BASE_REF" "$HEAD_REF" 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+            ANSIBLE_FILES_CHANGED=$(git diff --name-only "origin/$BASE_REF" "$HEAD_REF" 2>/dev/null | grep -E '^infra/ansible/' || echo "")
           elif [ "${{ github.event_name }}" == "push" ]; then
             # For pushes, compare with previous commit
             if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
@@ -178,39 +183,48 @@ jobs:
               
               # Try diff with commit hashes first
               TERRAFORM_FILES_CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+              ANSIBLE_FILES_CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null | grep -E '^infra/ansible/' || echo "")
               
               # If that failed, try with HEAD~1 (fallback for shallow clones)
-              if [ -z "$TERRAFORM_FILES_CHANGED" ]; then
+              if [ -z "$TERRAFORM_FILES_CHANGED" ] && [ -z "$ANSIBLE_FILES_CHANGED" ]; then
                 echo "Warning: Could not diff with $BEFORE, trying HEAD~1 as fallback"
                 TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+                ANSIBLE_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/ansible/' || echo "")
               fi
             else
-              # First commit or no before commit, check all Terraform files
-              echo "First commit or no previous commit - checking all Terraform files"
+              # First commit or no before commit, check all files
+              echo "First commit or no previous commit - checking all files"
               TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
-              if [ -z "$TERRAFORM_FILES_CHANGED" ]; then
+              ANSIBLE_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/ansible/' || echo "")
+              if [ -z "$TERRAFORM_FILES_CHANGED" ] && [ -z "$ANSIBLE_FILES_CHANGED" ]; then
                 # If that fails, assume files changed (safer for first run)
                 TERRAFORM_FILES_CHANGED="infra/terraform/"
+                ANSIBLE_FILES_CHANGED="infra/ansible/"
               fi
             fi
           elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             # For manual runs, compare with last commit on same branch
             echo "Manual workflow dispatch: Comparing with last commit"
             TERRAFORM_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/terraform/' || echo "")
+            ANSIBLE_FILES_CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '^infra/ansible/' || echo "")
           fi
           
           if [ -n "$TERRAFORM_FILES_CHANGED" ]; then
             echo "✅ Terraform files changed:"
             echo "$TERRAFORM_FILES_CHANGED" | sed 's/^/  - /'
             echo "terraform_files_changed=true" >> $GITHUB_OUTPUT
-            {
-              echo "changed_files<<EOF"
-              echo "$TERRAFORM_FILES_CHANGED"
-              echo "EOF"
-            } >> $GITHUB_OUTPUT
           else
             echo "ℹ️  No Terraform files changed in this commit/PR"
             echo "terraform_files_changed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ -n "$ANSIBLE_FILES_CHANGED" ]; then
+            echo "✅ Ansible files changed:"
+            echo "$ANSIBLE_FILES_CHANGED" | sed 's/^/  - /'
+            echo "ansible_files_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  No Ansible files changed in this commit/PR"
+            echo "ansible_files_changed=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Terraform Plan
@@ -228,12 +242,33 @@ jobs:
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=true" >> $GITHUB_OUTPUT
             echo "change_type=first_run" >> $GITHUB_OUTPUT
+            echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # First run always creates infrastructure
           elif terraform show -no-color tfplan | grep -q "No changes"; then
             echo "No changes detected - infrastructure is in sync"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=false" >> $GITHUB_OUTPUT
             echo "change_type=none" >> $GITHUB_OUTPUT
-          elif [ "${{ steps.terraform-files-check.outputs.terraform_files_changed }}" == "true" ]; then
+            echo "infrastructure_changed=false" >> $GITHUB_OUTPUT  # No infrastructure changes
+          elif [ "${{ steps.file-changes-check.outputs.terraform_files_changed }}" == "true" ]; then
+            echo "Terraform files were modified - these are expected changes, not drift"
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=expected" >> $GITHUB_OUTPUT
+            echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # Plan shows changes
+            terraform show -no-color tfplan > change_summary.txt
+            echo "📝 Change summary saved (expected changes from code updates)"
+          else
+            echo "🚨 REAL DRIFT DETECTED - Infrastructure changed outside Terraform!"
+            echo "Terraform files did NOT change, but plan shows changes."
+            echo "This means infrastructure was modified manually or by another process."
+            echo "drift_detected=true" >> $GITHUB_OUTPUT
+            echo "is_first_run=false" >> $GITHUB_OUTPUT
+            echo "change_type=drift" >> $GITHUB_OUTPUT
+            echo "infrastructure_changed=true" >> $GITHUB_OUTPUT  # Plan shows changes
+            terraform show -no-color tfplan > drift_summary.txt
+            echo "🚨 Drift summary saved - requires immediate attention"
+          fi
+          elif [ "${{ steps.file-changes-check.outputs.terraform_files_changed }}" == "true" ]; then
             echo "Terraform files were modified - these are expected changes, not drift"
             echo "drift_detected=false" >> $GITHUB_OUTPUT
             echo "is_first_run=false" >> $GITHUB_OUTPUT
@@ -361,7 +396,14 @@ jobs:
     name: Ansible Deployment
     runs-on: ubuntu-latest
     needs: terraform-plan
-    if: success()
+    # Only run Ansible if:
+    # 1. Ansible files changed (playbook/roles updated), OR
+    # 2. Infrastructure actually changed (new instance, etc.), OR
+    # 3. First run (infrastructure being created for the first time)
+    if: |
+      needs.terraform-plan.outputs.ansible_files_changed == 'true' ||
+      needs.terraform-plan.outputs.infrastructure_changed == 'true' ||
+      needs.terraform-plan.outputs.change_type == 'first_run'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

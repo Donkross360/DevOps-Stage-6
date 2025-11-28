@@ -28,6 +28,53 @@
     repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
     state: present
 
+- name: Check if Docker is already installed
+  command: docker --version
+  register: docker_check
+  changed_when: false
+  failed_when: false
+  ignore_errors: yes
+
+- name: Display Docker installation status
+  debug:
+    msg: "Docker is already installed: {{ docker_check.stdout | default('Not found') }}"
+  when: docker_check.rc == 0
+
+- name: Display Docker installation status (not installed)
+  debug:
+    msg: "Docker is not installed, will install now"
+  when: docker_check.rc != 0
+
+- name: Wait for any running apt processes to finish
+  shell: |
+    timeout=120
+    elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+      if ! pgrep -x apt >/dev/null 2>&1 && ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
+        echo "No apt processes running"
+        exit 0
+      fi
+      echo "Waiting for apt processes to finish... ($elapsed/$timeout seconds)"
+      sleep 2
+      elapsed=$((elapsed + 2))
+    done
+    echo "Timeout waiting for apt processes, proceeding anyway..."
+    exit 0
+  register: wait_for_apt
+  changed_when: false
+  failed_when: false
+  when: docker_check.rc != 0  # Only wait if Docker is not installed
+
+- name: Update apt cache after adding Docker repository
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  retries: 5
+  delay: 10
+  register: apt_update_result
+  until: apt_update_result is succeeded
+  when: docker_check.rc != 0  # Only update cache if Docker is not installed
+
 - name: Install Docker
   apt:
     name:
@@ -37,7 +84,10 @@
       - docker-buildx-plugin
       - docker-compose-plugin
     state: present
-    update_cache: yes
+    update_cache: no  # Cache already updated earlier, avoid redundant updates
+  retries: 3
+  delay: 10
+  when: docker_check.rc != 0  # Only install if Docker is not installed
 
 - name: Install Docker Compose (standalone) - for compatibility
   get_url:
