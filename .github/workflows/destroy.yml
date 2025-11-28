@@ -47,105 +47,91 @@ jobs:
         with:
           terraform_version: 1.5.0
 
-      - name: Determine backend configuration and state location
-        id: backend-check
-        working-directory: infra/terraform
-        run: |
-          echo "🔍 Analyzing backend configuration to determine state location..."
-          
-          # Check backend.tf to determine where state should be stored
-          if grep -q 'backend "local"' backend.tf && grep -q 'path = "/mnt/terraform-state' backend.tf; then
-            echo "Backend: Local on EBS volume (/mnt/terraform-state/terraform.tfstate)"
-            echo "backend_type=ebs" >> $GITHUB_OUTPUT
-            echo "state_path=/mnt/terraform-state/terraform.tfstate" >> $GITHUB_OUTPUT
-          elif grep -q 'backend "s3"' backend.tf; then
-            echo "Backend: S3 remote backend"
-            echo "backend_type=s3" >> $GITHUB_OUTPUT
-            # Extract bucket and key from backend.tf if needed
-            BUCKET=$(grep -A 5 'backend "s3"' backend.tf | grep 'bucket' | sed 's/.*bucket.*=.*"\([^"]*\)".*/\1/' || echo "")
-            KEY=$(grep -A 5 'backend "s3"' backend.tf | grep 'key' | sed 's/.*key.*=.*"\([^"]*\)".*/\1/' || echo "")
-            echo "state_bucket=$BUCKET" >> $GITHUB_OUTPUT
-            echo "state_key=$KEY" >> $GITHUB_OUTPUT
-          else
-            echo "Backend: Local in CI/CD runner (terraform.tfstate)"
-            echo "backend_type=local" >> $GITHUB_OUTPUT
-            echo "state_path=terraform.tfstate" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Fetch state based on backend configuration
-        id: fetch-state
-        working-directory: infra/terraform
-        run: |
-          BACKEND_TYPE="${{ steps.backend-check.outputs.backend_type }}"
-          
-          if [ "$BACKEND_TYPE" == "ebs" ]; then
-            echo "📥 Backend is EBS-mounted. Fetching state from server..."
-            
-            # Get server IP from AWS
-            INSTANCE_ID=$(aws ec2 describe-instances \
-              --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
-              --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
-              --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
-            
-            if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
-              echo "⚠️  No instance found. Cannot fetch state from EBS volume."
-              echo "state_fetched=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            
-            SERVER_IP=$(aws ec2 describe-instances \
-              --instance-ids "$INSTANCE_ID" \
-              --query 'Reservations[0].Instances[0].PublicIpAddress' \
-              --output text 2>/dev/null || echo "")
-            
-            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "None" ]; then
-              echo "⚠️  Instance has no public IP. Cannot fetch state."
-              echo "state_fetched=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            
-            echo "Found instance $INSTANCE_ID at $SERVER_IP"
-            
-            # Setup SSH
-            mkdir -p ~/.ssh
-            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-            chmod 600 ~/.ssh/id_rsa
-            ssh-keyscan -H "$SERVER_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
-            
-            # Fetch state file from EBS volume
-            if scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
-              "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}@$SERVER_IP:/mnt/terraform-state/terraform.tfstate" \
-              terraform.tfstate 2>/dev/null; then
-              echo "✅ Successfully fetched state file from EBS volume!"
-              ls -lah terraform.tfstate
-              echo "state_fetched=true" >> $GITHUB_OUTPUT
-            else
-              echo "⚠️  Could not fetch state file from EBS volume"
-              echo "state_fetched=false" >> $GITHUB_OUTPUT
-            fi
-            
-          elif [ "$BACKEND_TYPE" == "s3" ]; then
-            echo "📥 Backend is S3. State will be fetched during terraform init."
-            echo "state_fetched=init" >> $GITHUB_OUTPUT
-            
-          else
-            echo "📥 Backend is local. Checking GitHub Actions artifacts..."
-            
-            # Try to download from artifacts
-            # Note: This step runs before terraform init, so we manually download
-            echo "Attempting to download state from artifacts..."
-            echo "state_fetched=artifacts" >> $GITHUB_OUTPUT
-          fi
-        continue-on-error: true
-
-      - name: Download state from artifacts (for local backend)
-        if: steps.backend-check.outputs.backend_type == 'local'
+      - name: Download state from artifacts (always try first - most recent in CI/CD)
         uses: actions/download-artifact@v4
         with:
           name: terraform-state
           path: infra/terraform/
           pattern: terraform.tfstate*
           allow-empty: true
+        continue-on-error: true
+
+      - name: Check if state exists in artifacts
+        id: check-artifacts
+        working-directory: infra/terraform
+        run: |
+          if [ -f terraform.tfstate ] || [ -f terraform.tfstate.backup ]; then
+            echo "✅ State file found in artifacts (most recent from CI/CD)"
+            echo "state_exists=true" >> $GITHUB_OUTPUT
+            ls -lah terraform.tfstate* || true
+          else
+            echo "⚠️  State file not found in artifacts"
+            echo "state_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine backend configuration for fallback
+        id: backend-check
+        if: steps.check-artifacts.outputs.state_exists == 'false'
+        working-directory: infra/terraform
+        run: |
+          echo "🔍 Artifacts missing. Checking backend configuration for fallback..."
+          
+          # Check backend.tf to determine where state might be stored
+          if grep -q 'backend "local"' backend.tf && grep -q 'path = "/mnt/terraform-state' backend.tf; then
+            echo "Backend: Local on EBS volume - will fetch from server"
+            echo "backend_type=ebs" >> $GITHUB_OUTPUT
+          elif grep -q 'backend "s3"' backend.tf; then
+            echo "Backend: S3 - state will be fetched during terraform init"
+            echo "backend_type=s3" >> $GITHUB_OUTPUT
+          else
+            echo "Backend: Local in CI/CD runner - artifacts should have it"
+            echo "backend_type=local" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch state from EBS volume (fallback if artifacts missing)
+        if: steps.check-artifacts.outputs.state_exists == 'false' && steps.backend-check.outputs.backend_type == 'ebs'
+        working-directory: infra/terraform
+        run: |
+          echo "📥 Artifacts missing. Fetching state from EBS volume on server..."
+          
+          # Get server IP from AWS
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
+            --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
+          
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+            echo "⚠️  No instance found. Cannot fetch state from EBS volume."
+            exit 0
+          fi
+          
+          SERVER_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "None" ]; then
+            echo "⚠️  Instance has no public IP. Cannot fetch state."
+            exit 0
+          fi
+          
+          echo "Found instance $INSTANCE_ID at $SERVER_IP"
+          
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$SERVER_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+          
+          # Fetch state file from EBS volume
+          if scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
+            "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}@$SERVER_IP:/mnt/terraform-state/terraform.tfstate" \
+            terraform.tfstate 2>/dev/null; then
+            echo "✅ Successfully fetched state file from EBS volume!"
+            ls -lah terraform.tfstate
+          else
+            echo "⚠️  Could not fetch state file from EBS volume"
+          fi
         continue-on-error: true
 
       - name: Verify state file exists
@@ -221,13 +207,83 @@ jobs:
               echo "Importing EBS volume: $VOL_ID"
               terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
               
-              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
-              echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-              terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed"
+              # Refresh state after volume import
+              terraform refresh -var-file=terraform.tfvars || true
+              
+              # Get device name from volume attachment
+              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "")
+              
+              if [ -n "$DEVICE" ] && [ "$DEVICE" != "None" ]; then
+                # Try importing volume attachment - format: <volume_id>:<instance_id>:<device>
+                # Note: Device might be /dev/sdf or /dev/nvme1n1 depending on instance type
+                echo "Attempting to import volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
+                
+                # Try the import, but don't fail if it doesn't work
+                # The attachment will be destroyed when volume or instance is destroyed
+                terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" 2>&1 || {
+                  echo "⚠️  Volume attachment import failed (non-critical - attachment will be destroyed with volume/instance)"
+                  echo "This is expected if the attachment format doesn't match exactly"
+                }
+              else
+                echo "⚠️  Could not determine device name for volume attachment"
+                echo "Skipping attachment import (non-critical)"
+              fi
             fi
           fi
           
           echo "✅ Import complete. Proceeding with destroy..."
+        continue-on-error: true
+
+      - name: Check and detach EBS volume if needed
+        working-directory: infra/terraform
+        run: |
+          echo "🔍 Checking if EBS volume attachment is in state..."
+          
+          # Check if volume attachment resource exists in state
+          if terraform state list 2>/dev/null | grep -q "aws_volume_attachment.terraform_state"; then
+            echo "✅ Volume attachment is in state - Terraform will handle detachment"
+          else
+            echo "⚠️  Volume attachment NOT in state - checking if volume needs manual detachment"
+            
+            # Get instance ID from state or AWS
+            INSTANCE_ID=$(terraform state show aws_instance.todo_app 2>/dev/null | grep -oP 'id\s+=\s+"\K[^"]+' | head -1 || echo "")
+            
+            if [ -z "$INSTANCE_ID" ]; then
+              # Try to get from AWS by tag
+              INSTANCE_ID=$(aws ec2 describe-instances \
+                --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+                --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
+                --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
+            fi
+            
+            if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+              # Check if there's a volume attached to this instance
+              VOL_ID=$(aws ec2 describe-volumes \
+                --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
+                --query 'Volumes[0].VolumeId' \
+                --output text 2>/dev/null || echo "")
+              
+              if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
+                echo "Found attached volume: $VOL_ID on instance: $INSTANCE_ID"
+                echo "⚠️  Volume attachment not in state - will detach manually before destroy"
+                echo "This ensures the volume can be destroyed without being stuck"
+                
+                # Detach the volume (force detach to avoid hanging)
+                aws ec2 detach-volume \
+                  --volume-id "$VOL_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --force 2>/dev/null || echo "Volume may already be detached or detaching"
+                
+                # Wait for detachment to complete
+                echo "Waiting for volume to detach..."
+                aws ec2 wait volume-available --volume-ids "$VOL_ID" --timeout 60 || echo "Volume detachment may still be in progress"
+              else
+                echo "No attached volume found - proceeding normally"
+              fi
+            else
+              echo "No instance found - proceeding normally"
+            fi
+          fi
         continue-on-error: true
 
       - name: Terraform Plan Destroy
