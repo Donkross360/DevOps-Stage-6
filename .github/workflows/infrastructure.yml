@@ -439,6 +439,9 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
 
       - name: Log Expected Changes
         if: steps.drift-check.outputs.change_type == 'expected'

@@ -17,6 +17,11 @@ EMAIL_TO="${EMAIL_TO:-}"
 EMAIL_FROM="${EMAIL_FROM:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
+# GitHub Actions variables for workflow link
+GITHUB_SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}"
+GITHUB_RUN_ID="${GITHUB_RUN_ID:-}"
+
 # Check if email is configured
 if [ -z "$EMAIL_TO" ]; then
   echo "⚠️  EMAIL_TO not configured. Skipping email notification."
@@ -39,6 +44,12 @@ if ! command -v aws &> /dev/null; then
   exit 0
 fi
 
+# Build workflow run URL if GitHub variables are available
+WORKFLOW_URL=""
+if [ -n "$GITHUB_REPOSITORY" ] && [ -n "$GITHUB_RUN_ID" ]; then
+  WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+fi
+
 # Create email body
 SUBJECT="🚨 Terraform Drift Detected - Action Required"
 BODY=$(cat <<EOF
@@ -47,6 +58,8 @@ Terraform infrastructure drift has been detected.
 This means infrastructure was changed OUTSIDE of Terraform (e.g., manually in AWS Console).
 
 Please review the changes and approve the deployment in GitHub Actions.
+
+$(if [ -n "$WORKFLOW_URL" ]; then echo "🔗 View Workflow Run: $WORKFLOW_URL"; echo ""; fi)
 
 Drift Summary:
 $DRIFT_SUMMARY
