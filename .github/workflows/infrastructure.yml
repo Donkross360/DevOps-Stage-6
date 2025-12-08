@@ -453,18 +453,20 @@ jobs:
           echo "---"
           head -50 infra/terraform/change_summary.txt || echo "Change summary not available"
 
-      - name: Manual Approval for Real Drift (Prod Only)
-        if: steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT == 'prod'
+      - name: Manual Approval for Real Drift (All Environments)
+        if: steps.drift-check.outputs.change_type == 'drift'
         uses: trstringer/manual-approval@v1
         with:
           secret: ${{ github.TOKEN }}
           approvers: ${{ github.actor }}
           minimum-approvals: 1
-          issue-title: "🚨 REAL DRIFT DETECTED - Infrastructure Changed Outside Terraform"
+          issue-title: "🚨 REAL DRIFT DETECTED - Infrastructure Changed Outside Terraform (${{ env.ENVIRONMENT }})"
           issue-body: |
             **⚠️ CRITICAL: Real Infrastructure Drift Detected**
             
             Infrastructure has been modified **outside of Terraform**. This is unexpected and requires investigation.
+            
+            **Environment:** ${{ env.ENVIRONMENT }}
             
             **What happened:**
             - Terraform code files were **NOT modified**
@@ -480,6 +482,9 @@ jobs:
             ```
             ${{ steps.drift-check.outputs.drift_summary }}
             ```
+            
+            **Workflow Run:**
+            🔗 [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             
             **Note:** No Terraform files were changed in this commit, confirming this is real drift.
             
@@ -500,8 +505,7 @@ jobs:
           steps.drift-check.outputs.change_type == 'first_run' ||
           steps.drift-check.outputs.change_type == 'none' ||
           steps.drift-check.outputs.change_type == 'expected' ||
-          (steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT != 'prod') ||
-          (steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT == 'prod' && steps.manual-approval.outcome == 'success')
+          (steps.drift-check.outputs.change_type == 'drift' && steps.manual-approval.outcome == 'success')
         working-directory: infra/terraform
         run: |
           if [ "${{ steps.drift-check.outputs.change_type }}" == "drift" ]; then
