@@ -149,7 +149,7 @@ jobs:
             # Check if already in state
             if ! terraform state show aws_security_group.todo_app 2>/dev/null; then
               echo "Importing existing security group into Terraform state..."
-              terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_security_group.todo_app "$SG_ID" || echo "Import failed, will create new one"
+              terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" aws_security_group.todo_app "$SG_ID" || echo "Import failed, will create new one"
             else
               echo "Security group already in Terraform state"
             fi
@@ -251,14 +251,14 @@ jobs:
             echo "Found instance: $INSTANCE_ID"
             echo ""
             echo "Attempting to import the found instance anyway..."
-            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || {
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" aws_instance.todo_app "$INSTANCE_ID" || {
               echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
               echo "Please manually resolve the duplicate instances before proceeding."
               exit 1
             }
           else
             echo "Importing existing EC2 instance into Terraform state..."
-            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || {
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" aws_instance.todo_app "$INSTANCE_ID" || {
               echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
               echo "Please check AWS console and manually resolve before proceeding."
               exit 1
@@ -354,7 +354,7 @@ jobs:
 
       - name: Terraform Plan
         working-directory: infra/terraform
-        run: terraform plan -out=tfplan -var-file=${{ steps.use-tfvars.outputs.tfvars_file }}
+        run: terraform plan -out=tfplan -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
         continue-on-error: true
 
       - name: Check for Drift
@@ -501,7 +501,7 @@ jobs:
           else
             echo "ℹ️  No changes to apply"
           fi
-          terraform apply -auto-approve tfplan
+          terraform apply -auto-approve -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" tfplan
 
       - name: Upload Terraform State
         if: always()

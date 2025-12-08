@@ -235,7 +235,7 @@ jobs:
           
           if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
             echo "Importing security group: $SG_ID"
-            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
           fi
           
           # Import EC2 instance (environment-specific)
@@ -246,7 +246,7 @@ jobs:
           
           if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
             echo "Importing EC2 instance: $INSTANCE_ID"
-            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
           fi
           
           # Note: EBS volume imports removed - using S3 remote backend instead
@@ -312,7 +312,7 @@ jobs:
         working-directory: infra/terraform
         run: |
           echo "📋 Generating destroy plan..."
-          terraform plan -destroy -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -out=destroy.tfplan
+          terraform plan -destroy -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" -out=destroy.tfplan
           echo ""
           echo "⚠️ DESTRUCTION PLAN SUMMARY:"
           terraform show -no-color destroy.tfplan | head -100
@@ -328,7 +328,7 @@ jobs:
           echo "  - EBS volumes (including Terraform state volume)"
           echo "  - Volume attachments"
           echo ""
-          terraform destroy -auto-approve -var-file=${{ steps.use-tfvars.outputs.tfvars_file }}
+          terraform destroy -auto-approve -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
         continue-on-error: true
 
       - name: Verify Destruction
