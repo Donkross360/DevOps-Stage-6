@@ -501,7 +501,7 @@ jobs:
           else
             echo "ℹ️  No changes to apply"
           fi
-          terraform apply -auto-approve -var="key_pair_name=${{ secrets.TERRAFORM_KEY_PAIR_NAME }}" tfplan
+          terraform apply -auto-approve tfplan
 
       - name: Upload Terraform State
         if: always()
