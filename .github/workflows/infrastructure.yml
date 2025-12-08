@@ -542,6 +542,8 @@ jobs:
         with:
           name: terraform-state
           path: infra/terraform/
+          if-no-files-found: ignore
+        continue-on-error: true
 
       - name: Get Server IP from Terraform Output
         id: get-server-ip
@@ -551,42 +553,42 @@ jobs:
           ls -la terraform.tfstate* 2>/dev/null || echo "No state files found"
           
           # Check if state file exists
-          if [ ! -f terraform.tfstate ]; then
-            echo "ERROR: terraform.tfstate file not found"
-            exit 1
+          if [ -f terraform.tfstate ]; then
+            echo "State file found, trying to extract server IP from state..."
+            # Initialize Terraform to read outputs
+            terraform init -backend=false || true
+            
+            # Try to get server IP from Terraform output
+            echo "Trying Terraform output..."
+            SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
+            echo "Terraform output result: '$SERVER_IP'"
+            
+            # Fallback 1: Extract from state file using jq (if available) or grep
+            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
+              echo "Extracting server IP from state file using jq..."
+              if command -v jq &> /dev/null; then
+                SERVER_IP=$(jq -r '.resources[] | select(.type == "aws_instance") | .instances[0].attributes.public_ip // empty' terraform.tfstate 2>/dev/null | head -1 || echo "")
+              fi
+            fi
+            
+            # Fallback 2: Extract using grep from state file
+            if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
+              echo "Extracting server IP from state file using grep..."
+              SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
+              # Also try with escaped quotes
+              if [ -z "$SERVER_IP" ]; then
+                SERVER_IP=$(grep -oP '"public_ip":\s*"\K[^"]+' terraform.tfstate | head -1 || echo "")
+              fi
+              # Try without quotes
+              if [ -z "$SERVER_IP" ]; then
+                SERVER_IP=$(grep -o 'public_ip[^"]*"[^"]*"\([0-9.]\+\)' terraform.tfstate | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "")
+              fi
+            fi
+          else
+            echo "State file not found (first run or artifact not available), will query AWS directly..."
           fi
           
-          # Initialize Terraform to read outputs
-          terraform init -backend=false || true
-          
-          # Try to get server IP from Terraform output
-          echo "Trying Terraform output..."
-          SERVER_IP=$(terraform output -raw server_ip 2>/dev/null || echo "")
-          echo "Terraform output result: '$SERVER_IP'"
-          
-          # Fallback 1: Extract from state file using jq (if available) or grep
-          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
-            echo "Extracting server IP from state file using jq..."
-            if command -v jq &> /dev/null; then
-              SERVER_IP=$(jq -r '.resources[] | select(.type == "aws_instance") | .instances[0].attributes.public_ip // empty' terraform.tfstate 2>/dev/null | head -1 || echo "")
-            fi
-          fi
-          
-          # Fallback 2: Extract using grep from state file
-          if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ]; then
-            echo "Extracting server IP from state file using grep..."
-            SERVER_IP=$(grep -o '"public_ip":"[^"]*"' terraform.tfstate | head -1 | cut -d'"' -f4 || echo "")
-            # Also try with escaped quotes
-            if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(grep -oP '"public_ip":\s*"\K[^"]+' terraform.tfstate | head -1 || echo "")
-            fi
-            # Try without quotes
-            if [ -z "$SERVER_IP" ]; then
-              SERVER_IP=$(grep -o 'public_ip[^"]*"[^"]*"\([0-9.]\+\)' terraform.tfstate | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "")
-            fi
-          fi
-          
-          # Fallback 3: Query AWS directly - find by tag first (most reliable)
+          # Fallback: Query AWS directly - find by tag first (most reliable)
           if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" == "null" ] || [ "$SERVER_IP" == "None" ]; then
             echo "Querying AWS for server IP by tag..."
             # Find instance by tag (most reliable method)
