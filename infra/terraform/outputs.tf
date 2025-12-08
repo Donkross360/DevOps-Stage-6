@@ -13,13 +13,8 @@ output "ansible_inventory_path" {
   value       = local_file.ansible_inventory.filename
 }
 
-output "state_volume_id" {
-  description = "EBS volume ID for Terraform state storage"
-  value       = aws_ebs_volume.terraform_state.id
-}
-
-output "state_mount_path" {
-  description = "Mount path for Terraform state on EC2 instance"
-  value       = "/mnt/terraform-state"
+output "environment" {
+  description = "Current environment"
+  value       = var.environment
 }
 

@@ -1,0 +1,16 @@
+---
+# Development Environment Variables
+# These override or extend group_vars/all/vars.yml
+
+# Domain and SSL configuration
+domain: "dev.tutor-ai.im"  # Update with your dev domain
+letsencrypt_email: "martlab727@gmail.com"  # Update with your email
+
+# Repository configuration
+repo_url: https://github.com/Donkross360/DevOps-Stage-6.git
+repo_branch: main
+
+# JWT Secret (use different secrets per environment!)
+jwt_secret: "dev-secret-change-me"
+
+

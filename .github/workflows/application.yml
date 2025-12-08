@@ -18,11 +18,23 @@ on:
       - 'log-message-processor/**'
       - 'docker-compose.yml'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev, stg, prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+        default: 'dev'
 
 jobs:
   deploy:
-    name: Deploy Application
+    name: Deploy Application (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -37,17 +49,19 @@ jobs:
       - name: Get Server IP from AWS
         id: get-server-ip
         run: |
-          echo "Finding EC2 instance by tag Name=todo-app-server..."
+          ENV="${{ env.ENVIRONMENT }}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
+          echo "Finding EC2 instance by tag Name=$INSTANCE_NAME..."
           
-          # Find instance by tag (most reliable method)
+          # Find instance by tag (environment-specific)
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping" \
             --query 'Reservations[0].Instances[0].InstanceId' \
             --output text 2>/dev/null || echo "")
           
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ] || [ "$INSTANCE_ID" == "null" ]; then
-            echo "ERROR: Could not find EC2 instance with tag Name=todo-app-server"
-            echo "Please ensure the infrastructure workflow has run and created the instance."
+            echo "ERROR: Could not find EC2 instance with tag Name=$INSTANCE_NAME"
+            echo "Please ensure the infrastructure workflow has run and created the instance for environment $ENV."
             exit 1
           fi
           
@@ -70,8 +84,9 @@ jobs:
 
       - name: Generate Ansible Inventory
         run: |
+          ENV="${{ env.ENVIRONMENT }}"
           mkdir -p infra/ansible/inventory
-          cat > infra/ansible/inventory/hosts.yml <<EOF
+          cat > infra/ansible/inventory/${ENV}.yml <<EOF
           all:
             hosts:
               todo-app-server:
@@ -80,8 +95,8 @@ jobs:
                 ansible_ssh_private_key_file: ~/.ssh/id_rsa
                 ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
           EOF
-          echo "Generated inventory file:"
-          cat infra/ansible/inventory/hosts.yml
+          echo "Generated inventory file for environment $ENV:"
+          cat infra/ansible/inventory/${ENV}.yml
 
       - name: Setup SSH
         run: |
@@ -105,8 +120,9 @@ jobs:
 
       - name: Deploy Application
         run: |
+          ENV="${{ env.ENVIRONMENT }}"
           cd infra/ansible
-          ansible-playbook -i inventory/hosts.yml playbook.yml --tags deploy
+          ansible-playbook -i inventory/${ENV}.yml playbook.yml --tags deploy -e "environment=${ENV}"
         env:
           ANSIBLE_HOST_KEY_CHECKING: False
           ANSIBLE_SSH_PRIVATE_KEY_FILE: ~/.ssh/id_rsa

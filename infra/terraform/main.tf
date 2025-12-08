@@ -85,34 +85,12 @@ resource "aws_security_group" "todo_app" {
   }
 
   tags = {
-    Name = "todo-app-sg"
+    Name        = "todo-app-sg-${var.environment}"
+    Environment = var.environment
   }
 }
 
-# EBS Volume for Terraform State Storage
-resource "aws_ebs_volume" "terraform_state" {
-  availability_zone = aws_instance.todo_app.availability_zone
-  size              = var.state_volume_size
-  type              = "gp3"
-  encrypted         = true
-  
-  tags = {
-    Name        = "terraform-state-storage"
-    Purpose     = "Terraform state storage"
-    Environment = "production"
-  }
-}
-
-# Attach EBS Volume to EC2 Instance
-resource "aws_volume_attachment" "terraform_state" {
-  device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.terraform_state.id
-  instance_id = aws_instance.todo_app.id
-  
-  # Prevent detachment during instance replacement
-  skip_destroy = false
-  force_detach = true
-}
+# Note: EBS volume for local state storage removed - using S3 remote backend instead
 
 # EC2 Instance
 resource "aws_instance" "todo_app" {
@@ -129,51 +107,11 @@ resource "aws_instance" "todo_app" {
     # Update system
     apt-get update
     apt-get install -y python3 python3-pip
-    
-    # Wait for EBS volume to attach
-    echo "Waiting for EBS volume to attach..."
-    while [ ! -b /dev/xvdf ] && [ ! -b /dev/nvme1n1 ]; do
-      sleep 2
-    done
-    
-    # Determine device name (varies by instance type)
-    if [ -b /dev/nvme1n1 ]; then
-      DEVICE="/dev/nvme1n1"
-    elif [ -b /dev/xvdf ]; then
-      DEVICE="/dev/xvdf"
-    else
-      echo "EBS volume not found"
-      exit 1
-    fi
-    
-    # Create filesystem if it doesn't exist
-    if ! blkid $DEVICE > /dev/null 2>&1; then
-      echo "Creating filesystem on $DEVICE..."
-      mkfs -t ext4 $DEVICE
-    fi
-    
-    # Create mount point
-    mkdir -p /mnt/terraform-state
-    
-    # Mount the volume
-    mount $DEVICE /mnt/terraform-state
-    
-    # Make mount persistent
-    UUID=$(blkid -s UUID -o value $DEVICE)
-    if ! grep -q "$UUID" /etc/fstab; then
-      echo "UUID=$UUID /mnt/terraform-state ext4 defaults,nofail 0 2" >> /etc/fstab
-    fi
-    
-    # Set permissions
-    chown ${var.server_user}:${var.server_user} /mnt/terraform-state
-    chmod 755 /mnt/terraform-state
-    
-    echo "EBS volume mounted successfully at /mnt/terraform-state"
   EOF
 
   tags = {
-    Name        = "todo-app-server"
-    Environment = "production"
+    Name        = "todo-app-server-${var.environment}"
+    Environment = var.environment
     Project     = "hngi13-stage6"
   }
 
@@ -182,14 +120,14 @@ resource "aws_instance" "todo_app" {
   }
 }
 
-# Generate Ansible Inventory
+# Generate Ansible Inventory (per environment)
 resource "local_file" "ansible_inventory" {
   content = templatefile("${path.module}/templates/inventory.tpl", {
     server_ip   = aws_instance.todo_app.public_ip
     server_user = var.server_user
     ssh_key_path = var.ssh_key_path
   })
-  filename = "${path.module}/../ansible/inventory/hosts.yml"
+  filename = "${path.module}/../ansible/inventory/${var.environment}.yml"
 }
 
 # Null resource to trigger Ansible (skipped in CI/CD - workflow handles it)
@@ -230,7 +168,7 @@ resource "null_resource" "ansible_provision" {
       
       echo "SSH is ready! Running Ansible..."
       cd ${path.module}/../ansible
-      ansible-playbook -i inventory/hosts.yml playbook.yml
+      ansible-playbook -i inventory/${var.environment}.yml playbook.yml
     EOT
   }
 

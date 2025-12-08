@@ -28,6 +28,7 @@
     update: yes
   when: repo_exists.stat.exists
   register: git_pull_result
+  changed_when: git_pull_result.changed
 
 - name: Create letsencrypt directory
   file:
@@ -80,26 +81,49 @@
     owner: "{{ app_user }}"
     group: "{{ app_user }}"
     mode: '0600'
+  register: env_file_result
+  changed_when: env_file_result.changed
 
 - name: Check if docker-compose is running
-  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" ps
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" ps --format json
   register: compose_status
   changed_when: false
   failed_when: false
   args:
     chdir: "{{ app_dir }}"
 
-- name: Stop existing containers
-  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" down
+- name: Determine if rebuild is needed
+  set_fact:
+    needs_rebuild: "{{ git_pull_result.changed | default(false) or env_file_result.changed | default(false) }}"
+  when: repo_exists.stat.exists
+
+- name: Determine if rebuild is needed (first run)
+  set_fact:
+    needs_rebuild: true
+  when: not repo_exists.stat.exists
+
+- name: Pull latest images (always check for updates)
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" pull
   args:
     chdir: "{{ app_dir }}"
-  when: compose_status.rc == 0
+  register: image_pull_result
+  changed_when: "'Pulling' in image_pull_result.stdout or 'Downloaded' in image_pull_result.stdout"
+  failed_when: false
 
-- name: Build and start containers
-  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" up -d --build
+- name: Build images if code/config changed
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" build
+  args:
+    chdir: "{{ app_dir }}"
+  when: needs_rebuild | default(false)
+  register: compose_build_result
+  changed_when: "'built' in compose_build_result.stdout or 'Building' in compose_build_result.stdout"
+
+- name: Start/update containers (idempotent - only changes if needed)
+  shell: sudo docker compose -f "{{ app_dir }}/docker-compose.yml" up -d
   args:
     chdir: "{{ app_dir }}"
   register: compose_up_result
+  changed_when: "'created' in compose_up_result.stdout or 'started' in compose_up_result.stdout or 'recreated' in compose_up_result.stdout"
   notify: verify deployment
 
 - name: Wait for services to be healthy

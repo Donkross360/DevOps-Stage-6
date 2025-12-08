@@ -33,11 +33,7 @@ variable "server_user" {
   default     = "ubuntu"
 }
 
-variable "state_volume_size" {
-  description = "Size of EBS volume for Terraform state storage (GB)"
-  type        = number
-  default     = 10
-}
+# Note: state_volume_size removed - using S3 remote backend instead
 
 variable "availability_zone" {
   description = "Availability zone for EC2 instance and EBS volume (optional, auto-selected if not specified)"
@@ -49,5 +45,16 @@ variable "skip_ansible_provision" {
   description = "Skip Ansible provisioner (useful in CI/CD where workflow handles it separately)"
   type        = bool
   default     = false
+}
+
+variable "environment" {
+  description = "Environment name (dev, stg, prod)"
+  type        = string
+  default     = "dev"
+  
+  validation {
+    condition     = contains(["dev", "stg", "prod"], var.environment)
+    error_message = "Environment must be one of: dev, stg, prod"
+  }
 }
 

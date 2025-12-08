@@ -1,0 +1,16 @@
+---
+# Staging Environment Variables
+# These override or extend group_vars/all/vars.yml
+
+# Domain and SSL configuration
+domain: "stg.tutor-ai.im"  # Update with your staging domain
+letsencrypt_email: "martlab727@gmail.com"  # Update with your email
+
+# Repository configuration
+repo_url: https://github.com/Donkross360/DevOps-Stage-6.git
+repo_branch: main
+
+# JWT Secret (use different secrets per environment!)
+jwt_secret: "stg-secret-change-me"
+
+

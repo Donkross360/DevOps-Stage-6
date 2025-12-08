@@ -10,16 +10,28 @@ on:
       - 'infra/terraform/**'
       - 'infra/ansible/**'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev, stg, prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+        default: 'dev'
 
 # Prevent duplicate runs - cancel in-progress runs when a new one starts
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.environment || 'dev' }}
   cancel-in-progress: true
 
 jobs:
   terraform-plan:
-    name: Terraform Plan & Drift Detection
+    name: Terraform Plan & Drift Detection (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
     outputs:
       drift_detected: ${{ steps.drift-check.outputs.drift_detected }}
       server_ip: ${{ steps.get-server-ip.outputs.server_ip }}
@@ -44,9 +56,52 @@ jobs:
         with:
           terraform_version: 1.5.0
 
-      - name: Terraform Init
+      - name: Configure S3 Backend
+        id: backend-config
+        run: |
+          ENV="${{ env.ENVIRONMENT }}"
+          echo "Configuring S3 backend for environment: $ENV"
+          
+          # Set backend configuration from secrets (per environment)
+          BACKEND_BUCKET="${{ secrets.TERRAFORM_STATE_BUCKET }}"
+          BACKEND_KEY="terraform-state/${ENV}/terraform.tfstate"
+          BACKEND_REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          BACKEND_DYNAMODB_TABLE="${{ secrets.TERRAFORM_STATE_LOCK_TABLE }}"
+          
+          echo "Backend Bucket: $BACKEND_BUCKET"
+          echo "Backend Key: $BACKEND_KEY"
+          echo "Backend Region: $BACKEND_REGION"
+          echo "DynamoDB Table: $BACKEND_DYNAMODB_TABLE"
+          
+          if [ -z "$BACKEND_BUCKET" ] || [ -z "$BACKEND_DYNAMODB_TABLE" ]; then
+            echo "⚠️  WARNING: Backend bucket or DynamoDB table not configured in secrets"
+            echo "Using local backend (not recommended for production)"
+            echo "backend_configured=false" >> $GITHUB_OUTPUT
+          else
+            echo "backend_configured=true" >> $GITHUB_OUTPUT
+            echo "backend_bucket=$BACKEND_BUCKET" >> $GITHUB_OUTPUT
+            echo "backend_key=$BACKEND_KEY" >> $GITHUB_OUTPUT
+            echo "backend_region=$BACKEND_REGION" >> $GITHUB_OUTPUT
+            echo "backend_table=$BACKEND_DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init (with remote backend)
+        if: steps.backend-config.outputs.backend_configured == 'true'
         working-directory: infra/terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.backend-config.outputs.backend_bucket }}" \
+            -backend-config="key=${{ steps.backend-config.outputs.backend_key }}" \
+            -backend-config="region=${{ steps.backend-config.outputs.backend_region }}" \
+            -backend-config="dynamodb_table=${{ steps.backend-config.outputs.backend_table }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Init (local backend fallback)
+        if: steps.backend-config.outputs.backend_configured != 'true'
+        working-directory: infra/terraform
+        run: |
+          echo "⚠️  Using local backend (configure S3 backend in secrets for production)"
+          terraform init -backend=false
 
       - name: Remove null_resource from state if exists (for count transition)
         working-directory: infra/terraform
@@ -60,27 +115,32 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Create terraform.tfvars from GitHub Secrets
+      - name: Use environment-specific tfvars
+        id: use-tfvars
         working-directory: infra/terraform
         run: |
-            cat > terraform.tfvars <<EOF
-            aws_region = "${{ secrets.AWS_REGION || 'us-east-1' }}"
-            instance_type = "${{ secrets.TERRAFORM_INSTANCE_TYPE || 't3.medium' }}"
-            key_pair_name = "${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
-            ssh_key_path = "${{ secrets.TERRAFORM_SSH_KEY_PATH || '~/.ssh/id_rsa' }}"
-            ssh_cidr = "${{ secrets.TERRAFORM_SSH_CIDR || '0.0.0.0/0' }}"
-            server_user = "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}"
-            state_volume_size = ${{ secrets.TERRAFORM_STATE_VOLUME_SIZE || 10 }}
-            availability_zone = ""
-            skip_ansible_provision = true
-            EOF
+          ENV="${{ env.ENVIRONMENT }}"
+          TFVARS_FILE="terraform.${ENV}.tfvars"
+          
+          if [ ! -f "$TFVARS_FILE" ]; then
+            echo "❌ Error: $TFVARS_FILE not found"
+            echo "Available files:"
+            ls -la terraform.*.tfvars 2>/dev/null || echo "No environment tfvars files found"
+            exit 1
+          fi
+          
+          echo "✅ Using $TFVARS_FILE for environment: $ENV"
+          echo "tfvars_file=$TFVARS_FILE" >> $GITHUB_OUTPUT
 
       - name: Import existing security group (if exists)
         working-directory: infra/terraform
         run: |
-          # Try to find existing security group by name
+          ENV="${{ env.ENVIRONMENT }}"
+          SG_NAME="todo-app-sg-${ENV}"
+          
+          # Try to find existing security group by name (environment-specific)
           SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=todo-app-sg" \
+            --filters "Name=group-name,Values=$SG_NAME" \
             --query 'SecurityGroups[0].GroupId' \
             --output text 2>/dev/null || echo "")
           
@@ -89,7 +149,7 @@ jobs:
             # Check if already in state
             if ! terraform state show aws_security_group.todo_app 2>/dev/null; then
               echo "Importing existing security group into Terraform state..."
-              terraform import -var-file=terraform.tfvars aws_security_group.todo_app "$SG_ID" || echo "Import failed, will create new one"
+              terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_security_group.todo_app "$SG_ID" || echo "Import failed, will create new one"
             else
               echo "Security group already in Terraform state"
             fi
@@ -101,9 +161,12 @@ jobs:
       - name: Check for duplicate instances
         working-directory: infra/terraform
         run: |
-          # Check for multiple instances with the same tag
+          ENV="${{ env.ENVIRONMENT }}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
+          
+          # Check for multiple instances with the same tag (environment-specific)
           INSTANCE_COUNT=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
             --query 'length(Reservations[*].Instances[*])' \
             --output text 2>/dev/null || echo "0")
           
@@ -112,7 +175,7 @@ jobs:
             echo ""
             echo "This indicates duplicate instances. Listing all instances:"
             aws ec2 describe-instances \
-              --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
               --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime,PublicIpAddress]' \
               --output table 2>/dev/null || true
             echo ""
@@ -133,9 +196,12 @@ jobs:
       - name: Import existing EC2 instance (if exists)
         working-directory: infra/terraform
         run: |
-          # Check for ALL instances with the tag (not just the first one)
+          ENV="${{ env.ENVIRONMENT }}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
+          
+          # Check for ALL instances with the tag (environment-specific)
           ALL_INSTANCES=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
             --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime]' \
             --output text 2>/dev/null || echo "")
           
@@ -157,11 +223,11 @@ jobs:
             echo "Selecting the most recent RUNNING instance, or oldest if none are running..."
           fi
           
-          # Try to find existing EC2 instance by tag Name=todo-app-server
+          # Try to find existing EC2 instance by tag (environment-specific)
           # Prefer running instances, then stopped, then others
           # Get the most recent one
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
             --query 'Reservations[*].Instances[*].[InstanceId,State.Name,LaunchTime]' \
             --output text 2>/dev/null | \
             sort -k3 -r | \
@@ -185,41 +251,21 @@ jobs:
             echo "Found instance: $INSTANCE_ID"
             echo ""
             echo "Attempting to import the found instance anyway..."
-            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || {
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || {
               echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
               echo "Please manually resolve the duplicate instances before proceeding."
               exit 1
             }
           else
             echo "Importing existing EC2 instance into Terraform state..."
-            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || {
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || {
               echo "❌ Import failed. This might cause Terraform to create a duplicate instance."
               echo "Please check AWS console and manually resolve before proceeding."
               exit 1
             }
           fi
           
-          # Also check for and import associated EBS volume if it exists
-          echo "Checking for associated EBS volume..."
-          VOL_ID=$(aws ec2 describe-volumes \
-            --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
-            --query 'Volumes[0].VolumeId' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
-            echo "Found associated EBS volume: $VOL_ID"
-            # Import EBS volume if not in state
-            if ! terraform state show aws_ebs_volume.terraform_state 2>/dev/null; then
-              echo "Importing EBS volume into Terraform state..."
-              terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed (non-critical)"
-            fi
-            # Import volume attachment format: <volume_id>:<instance_id>:<device>
-            if ! terraform state show aws_volume_attachment.terraform_state 2>/dev/null; then
-              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "/dev/sdf")
-              echo "Importing volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-              terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" || echo "Volume attachment import failed (non-critical)"
-            fi
-          fi
+          # Note: EBS volume imports removed - using S3 remote backend instead
         continue-on-error: true
 
       - name: Remove existing null_resource from state (if needed)
@@ -308,7 +354,7 @@ jobs:
 
       - name: Terraform Plan
         working-directory: infra/terraform
-        run: terraform plan -out=tfplan -var-file=terraform.tfvars
+        run: terraform plan -out=tfplan -var-file=${{ steps.use-tfvars.outputs.tfvars_file }}
         continue-on-error: true
 
       - name: Check for Drift
@@ -395,8 +441,8 @@ jobs:
           echo "---"
           head -50 infra/terraform/change_summary.txt || echo "Change summary not available"
 
-      - name: Manual Approval for Real Drift (Only)
-        if: steps.drift-check.outputs.change_type == 'drift'
+      - name: Manual Approval for Real Drift (Prod Only)
+        if: steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT == 'prod'
         uses: trstringer/manual-approval@v1
         with:
           secret: ${{ github.TOKEN }}
@@ -442,7 +488,8 @@ jobs:
           steps.drift-check.outputs.change_type == 'first_run' ||
           steps.drift-check.outputs.change_type == 'none' ||
           steps.drift-check.outputs.change_type == 'expected' ||
-          (steps.drift-check.outputs.change_type == 'drift' && steps.manual-approval.outcome == 'success')
+          (steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT != 'prod') ||
+          (steps.drift-check.outputs.change_type == 'drift' && env.ENVIRONMENT == 'prod' && steps.manual-approval.outcome == 'success')
         working-directory: infra/terraform
         run: |
           if [ "${{ steps.drift-check.outputs.change_type }}" == "drift" ]; then
@@ -466,9 +513,11 @@ jobs:
           if-no-files-found: ignore
 
   ansible-deploy:
-    name: Ansible Deployment
+    name: Ansible Deployment (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
     needs: terraform-plan
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
     # Only run Ansible if:
     # 1. Ansible files changed (playbook/roles updated), OR
     # 2. Infrastructure actually changed (new instance, etc.), OR
@@ -618,8 +667,9 @@ jobs:
 
       - name: Generate Ansible Inventory
         run: |
+          ENV="${{ env.ENVIRONMENT }}"
           mkdir -p infra/ansible/inventory
-          cat > infra/ansible/inventory/hosts.yml <<EOF
+          cat > infra/ansible/inventory/${ENV}.yml <<EOF
           all:
             hosts:
               todo-app-server:
@@ -628,8 +678,8 @@ jobs:
                 ansible_ssh_private_key_file: ~/.ssh/id_rsa
                 ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
           EOF
-          echo "Generated inventory file:"
-          cat infra/ansible/inventory/hosts.yml
+          echo "Generated inventory file for environment $ENV:"
+          cat infra/ansible/inventory/${ENV}.yml
 
       - name: Wait for SSH
         run: |
@@ -647,8 +697,9 @@ jobs:
 
       - name: Run Ansible Playbook
         run: |
+          ENV="${{ env.ENVIRONMENT }}"
           cd infra/ansible
-          ansible-playbook -i inventory/hosts.yml playbook.yml
+          ansible-playbook -i inventory/${ENV}.yml playbook.yml -e "environment=${ENV}"
         env:
           ANSIBLE_HOST_KEY_CHECKING: False
           ANSIBLE_SSH_PRIVATE_KEY_FILE: ~/.ssh/id_rsa

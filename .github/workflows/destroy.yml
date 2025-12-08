@@ -3,6 +3,15 @@ name: Infrastructure Destruction
 on:
   workflow_dispatch:  # Manual trigger only - safe!
     inputs:
+      environment:
+        description: 'Environment to destroy (dev, stg, prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+        default: 'dev'
       confirm_destroy:
         description: 'Type "DESTROY" to confirm (case-sensitive)'
         required: true
@@ -28,9 +37,11 @@ jobs:
           echo "✅ Destruction confirmed. Proceeding with infrastructure teardown..."
 
   terraform-destroy:
-    name: Destroy All Infrastructure
+    name: Destroy Infrastructure (${{ github.event.inputs.environment }})
     runs-on: ubuntu-latest
     needs: validate-destroy
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -94,9 +105,11 @@ jobs:
         run: |
           echo "📥 Artifacts missing. Fetching state from EBS volume on server..."
           
-          # Get server IP from AWS
+          # Get server IP from AWS (environment-specific)
+          ENV="${{ env.ENVIRONMENT }}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
             --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
             --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
           
@@ -151,24 +164,58 @@ jobs:
             echo "state_exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Terraform Init
-        working-directory: infra/terraform
-        run: terraform init
+      - name: Configure S3 Backend
+        id: backend-config
+        run: |
+          ENV="${{ env.ENVIRONMENT }}"
+          echo "Configuring S3 backend for environment: $ENV"
+          
+          BACKEND_BUCKET="${{ secrets.TERRAFORM_STATE_BUCKET }}"
+          BACKEND_KEY="terraform-state/${ENV}/terraform.tfstate"
+          BACKEND_REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          BACKEND_DYNAMODB_TABLE="${{ secrets.TERRAFORM_STATE_LOCK_TABLE }}"
+          
+          if [ -z "$BACKEND_BUCKET" ] || [ -z "$BACKEND_DYNAMODB_TABLE" ]; then
+            echo "⚠️  WARNING: Backend not configured - using local backend"
+            echo "backend_configured=false" >> $GITHUB_OUTPUT
+          else
+            echo "backend_configured=true" >> $GITHUB_OUTPUT
+            echo "backend_bucket=$BACKEND_BUCKET" >> $GITHUB_OUTPUT
+            echo "backend_key=$BACKEND_KEY" >> $GITHUB_OUTPUT
+            echo "backend_region=$BACKEND_REGION" >> $GITHUB_OUTPUT
+            echo "backend_table=$BACKEND_DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Create terraform.tfvars from GitHub Secrets
+      - name: Terraform Init (with remote backend)
+        if: steps.backend-config.outputs.backend_configured == 'true'
         working-directory: infra/terraform
         run: |
-          cat > terraform.tfvars <<EOF
-          aws_region = "${{ secrets.AWS_REGION || 'us-east-1' }}"
-          instance_type = "${{ secrets.TERRAFORM_INSTANCE_TYPE || 't3.medium' }}"
-          key_pair_name = "${{ secrets.TERRAFORM_KEY_PAIR_NAME }}"
-          ssh_key_path = "${{ secrets.TERRAFORM_SSH_KEY_PATH || '~/.ssh/id_rsa' }}"
-          ssh_cidr = "${{ secrets.TERRAFORM_SSH_CIDR || '0.0.0.0/0' }}"
-          server_user = "${{ secrets.TERRAFORM_SERVER_USER || 'ubuntu' }}"
-          state_volume_size = ${{ secrets.TERRAFORM_STATE_VOLUME_SIZE || 10 }}
-          availability_zone = ""
-          skip_ansible_provision = true
-          EOF
+          terraform init \
+            -backend-config="bucket=${{ steps.backend-config.outputs.backend_bucket }}" \
+            -backend-config="key=${{ steps.backend-config.outputs.backend_key }}" \
+            -backend-config="region=${{ steps.backend-config.outputs.backend_region }}" \
+            -backend-config="dynamodb_table=${{ steps.backend-config.outputs.backend_table }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Init (local backend fallback)
+        if: steps.backend-config.outputs.backend_configured != 'true'
+        working-directory: infra/terraform
+        run: terraform init -backend=false
+
+      - name: Use environment-specific tfvars
+        id: use-tfvars
+        working-directory: infra/terraform
+        run: |
+          ENV="${{ env.ENVIRONMENT }}"
+          TFVARS_FILE="terraform.${ENV}.tfvars"
+          
+          if [ ! -f "$TFVARS_FILE" ]; then
+            echo "❌ Error: $TFVARS_FILE not found"
+            exit 1
+          fi
+          
+          echo "✅ Using $TFVARS_FILE for environment: $ENV"
+          echo "tfvars_file=$TFVARS_FILE" >> $GITHUB_OUTPUT
 
       - name: Import existing resources if state is missing
         if: steps.verify-state.outputs.state_exists == 'false'
@@ -176,60 +223,33 @@ jobs:
         run: |
           echo "⚠️  State file missing. Attempting to import existing resources..."
           
-          # Import security group
+          ENV="${{ env.ENVIRONMENT }}"
+          SG_NAME="todo-app-sg-${ENV}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
+          
+          # Import security group (environment-specific)
           SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=todo-app-sg" \
+            --filters "Name=group-name,Values=$SG_NAME" \
             --query 'SecurityGroups[0].GroupId' \
             --output text 2>/dev/null || echo "")
           
           if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
             echo "Importing security group: $SG_ID"
-            terraform import -var-file=terraform.tfvars aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_security_group.todo_app "$SG_ID" || echo "Security group import failed"
           fi
           
-          # Import EC2 instance (get the most recent one if multiple exist)
+          # Import EC2 instance (environment-specific)
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
             --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
             --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
           
           if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
             echo "Importing EC2 instance: $INSTANCE_ID"
-            terraform import -var-file=terraform.tfvars aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
-            
-            # Import EBS volume
-            VOL_ID=$(aws ec2 describe-volumes \
-              --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" "Name=tag:Name,Values=terraform-state-storage" \
-              --query 'Volumes[0].VolumeId' \
-              --output text 2>/dev/null || echo "")
-            
-            if [ -n "$VOL_ID" ] && [ "$VOL_ID" != "None" ]; then
-              echo "Importing EBS volume: $VOL_ID"
-              terraform import -var-file=terraform.tfvars aws_ebs_volume.terraform_state "$VOL_ID" || echo "EBS volume import failed"
-              
-              # Refresh state after volume import
-              terraform refresh -var-file=terraform.tfvars || true
-              
-              # Get device name from volume attachment
-              DEVICE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" --query 'Volumes[0].Attachments[0].Device' --output text 2>/dev/null || echo "")
-              
-              if [ -n "$DEVICE" ] && [ "$DEVICE" != "None" ]; then
-                # Try importing volume attachment - format: <volume_id>:<instance_id>:<device>
-                # Note: Device might be /dev/sdf or /dev/nvme1n1 depending on instance type
-                echo "Attempting to import volume attachment: $VOL_ID:$INSTANCE_ID:$DEVICE"
-                
-                # Try the import, but don't fail if it doesn't work
-                # The attachment will be destroyed when volume or instance is destroyed
-                terraform import -var-file=terraform.tfvars aws_volume_attachment.terraform_state "${VOL_ID}:${INSTANCE_ID}:${DEVICE}" 2>&1 || {
-                  echo "⚠️  Volume attachment import failed (non-critical - attachment will be destroyed with volume/instance)"
-                  echo "This is expected if the attachment format doesn't match exactly"
-                }
-              else
-                echo "⚠️  Could not determine device name for volume attachment"
-                echo "Skipping attachment import (non-critical)"
-              fi
-            fi
+            terraform import -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} aws_instance.todo_app "$INSTANCE_ID" || echo "EC2 instance import failed"
           fi
+          
+          # Note: EBS volume imports removed - using S3 remote backend instead
           
           echo "✅ Import complete. Proceeding with destroy..."
         continue-on-error: true
@@ -249,9 +269,11 @@ jobs:
             INSTANCE_ID=$(terraform state show aws_instance.todo_app 2>/dev/null | grep -oP 'id\s+=\s+"\K[^"]+' | head -1 || echo "")
             
             if [ -z "$INSTANCE_ID" ]; then
-              # Try to get from AWS by tag
+              # Try to get from AWS by tag (environment-specific)
+              ENV="${{ env.ENVIRONMENT }}"
+              INSTANCE_NAME="todo-app-server-${ENV}"
               INSTANCE_ID=$(aws ec2 describe-instances \
-                --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+                --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
                 --query 'Reservations[*].Instances[*].[InstanceId,LaunchTime]' \
                 --output text 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}' || echo "")
             fi
@@ -290,7 +312,7 @@ jobs:
         working-directory: infra/terraform
         run: |
           echo "📋 Generating destroy plan..."
-          terraform plan -destroy -var-file=terraform.tfvars -out=destroy.tfplan
+          terraform plan -destroy -var-file=${{ steps.use-tfvars.outputs.tfvars_file }} -out=destroy.tfplan
           echo ""
           echo "⚠️ DESTRUCTION PLAN SUMMARY:"
           terraform show -no-color destroy.tfplan | head -100
@@ -306,7 +328,7 @@ jobs:
           echo "  - EBS volumes (including Terraform state volume)"
           echo "  - Volume attachments"
           echo ""
-          terraform destroy -auto-approve -var-file=terraform.tfvars
+          terraform destroy -auto-approve -var-file=${{ steps.use-tfvars.outputs.tfvars_file }}
         continue-on-error: true
 
       - name: Verify Destruction
@@ -319,9 +341,11 @@ jobs:
           echo ""
           echo "Checking for orphaned resources..."
           
-          # Check for EC2 instances
+          # Check for EC2 instances (environment-specific)
+          ENV="${{ env.ENVIRONMENT }}"
+          INSTANCE_NAME="todo-app-server-${ENV}"
           INSTANCES=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=todo-app-server" "Name=instance-state-name,Values=running,stopped,stopping" \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running,stopped,stopping" \
             --query 'Reservations[*].Instances[*].InstanceId' \
             --output text 2>/dev/null || echo "")
           
@@ -332,9 +356,10 @@ jobs:
             echo "✅ No EC2 instances found"
           fi
           
-          # Check for security groups
+          # Check for security groups (environment-specific)
+          SG_NAME="todo-app-sg-${ENV}"
           SGS=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=todo-app-sg" \
+            --filters "Name=group-name,Values=$SG_NAME" \
             --query 'SecurityGroups[*].GroupId' \
             --output text 2>/dev/null || echo "")
           
